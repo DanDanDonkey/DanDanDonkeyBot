@@ -120,12 +120,30 @@ class SpringTemplateBot2026(ForecastBot):
     _structure_output_validation_samples = 2
 
     ##################################### RESEARCH #####################################
-
-    async def run_research(self, question: MetaculusQuestion) -> str:
+           async def run_research(self, question: MetaculusQuestion) -> str:
         async with self._concurrency_limiter:
-            research = ""
-            researcher = self.get_llm("researcher")
+            import requests
 
+            # Step 1: Get free news from GDELT
+            gdelt_context = ""
+            try:
+                query = question.question_text[:100].replace(" ", "%20")
+                gdelt_url = f"https://api.gdeltproject.org/api/v2/doc/doc?query={query}&mode=ArtList&maxrecords=10&format=json"
+                gdelt_response = requests.get(gdelt_url, timeout=15)
+                if gdelt_response.status_code == 200:
+                    gdelt_data = gdelt_response.json()
+                    articles = gdelt_data.get("articles", [])
+                    gdelt_context = "\n".join([
+                        f"- {a.get('title', 'No title')} (Source: {a.get('domain', 'Unknown')}, Date: {a.get('seendate', 'Unknown')})"
+                        for a in articles[:10]
+                    ])
+                    if gdelt_context:
+                        gdelt_context = f"\n\nRecent news articles from GDELT:\n{gdelt_context}"
+            except Exception as e:
+                logger.warning(f"GDELT search failed: {e}")
+                gdelt_context = ""
+
+            # Step 2: Send research prompt to LLM with GDELT context
             prompt = clean_indents(
                 f"""
                 You are an assistant to a superforecaster.
@@ -140,9 +158,11 @@ class SpringTemplateBot2026(ForecastBot):
                 {question.resolution_criteria}
 
                 {question.fine_print}
+                {gdelt_context}
                 """
             )
 
+            researcher = self.get_llm("researcher")
             if isinstance(researcher, GeneralLlm):
                 research = await researcher.invoke(prompt)
             elif (
@@ -168,6 +188,7 @@ class SpringTemplateBot2026(ForecastBot):
                 research = ""
             else:
                 research = await self.get_llm("researcher", "llm").invoke(prompt)
+
             logger.info(f"Found Research for URL {question.page_url}:\n{research}")
             return research
 
@@ -677,17 +698,17 @@ if __name__ == "__main__":
             "default": GeneralLlm(
                 model="openrouter/deepseek/deepseek-r1",
                 temperature=0.3,
-                timeout=120,
+                timeout=300,
                 allowed_tries=2,
             ),
-            "summarizer": "openrouter/deepseek/deepseek-r1",
+            "summarizer": "openrouter/deepseek/deepseek-chat",
             "researcher": GeneralLlm(
                 model="openrouter/deepseek/deepseek-r1",
                 temperature=0.3,
-                timeout=120,
+                timeout=300,
                 allowed_tries=2,
             ),
-            "parser": "openrouter/deepseek/deepseek-r1",
+            "parser": "openrouter/deepseek/deepseek-chat",
         },
     )
 
