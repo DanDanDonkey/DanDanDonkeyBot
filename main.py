@@ -121,76 +121,76 @@ class SpringTemplateBot2026(ForecastBot):
 
     ##################################### RESEARCH #####################################
            async def run_research(self, question: MetaculusQuestion) -> str:
-        async with self._concurrency_limiter:
-            import requests
-
-            # Step 1: Get free news from GDELT
-            gdelt_context = ""
-            try:
-                query = question.question_text[:100].replace(" ", "%20")
-                gdelt_url = f"https://api.gdeltproject.org/api/v2/doc/doc?query={query}&mode=ArtList&maxrecords=10&format=json"
-                gdelt_response = requests.get(gdelt_url, timeout=15)
-                if gdelt_response.status_code == 200:
-                    gdelt_data = gdelt_response.json()
-                    articles = gdelt_data.get("articles", [])
-                    gdelt_context = "\n".join([
-                        f"- {a.get('title', 'No title')} (Source: {a.get('domain', 'Unknown')}, Date: {a.get('seendate', 'Unknown')})"
-                        for a in articles[:10]
-                    ])
-                    if gdelt_context:
-                        gdelt_context = f"\n\nRecent news articles from GDELT:\n{gdelt_context}"
-            except Exception as e:
-                logger.warning(f"GDELT search failed: {e}")
-                gdelt_context = ""
-
-            # Step 2: Send research prompt to LLM with GDELT context
-            prompt = clean_indents(
-                f"""
-                You are an assistant to a superforecaster.
-                The superforecaster will give you a question they intend to forecast on.
-                To be a great assistant, you generate a concise but detailed rundown of the most relevant news, including if the question would resolve Yes or No based on current information.
-                You do not produce forecasts yourself.
-
-                Question:
-                {question.question_text}
-
-                This question's outcome will be determined by the specific criteria below:
-                {question.resolution_criteria}
-
-                {question.fine_print}
-                {gdelt_context}
-                """
-            )
-
-            researcher = self.get_llm("researcher")
-            if isinstance(researcher, GeneralLlm):
-                research = await researcher.invoke(prompt)
-            elif (
-                researcher == "asknews/news-summaries"
-                or researcher == "asknews/deep-research/low-depth"
-                or researcher == "asknews/deep-research/medium-depth"
-                or researcher == "asknews/deep-research/high-depth"
-            ):
-                research = await AskNewsSearcher().call_preconfigured_version(
-                    researcher, prompt
-                )
-            elif researcher.startswith("smart-searcher"):
-                model_name = researcher.removeprefix("smart-searcher/")
-                searcher = SmartSearcher(
-                    model=model_name,
-                    temperature=0,
-                    num_searches_to_run=2,
-                    num_sites_per_search=10,
-                    use_advanced_filters=False,
-                )
-                research = await searcher.invoke(prompt)
-            elif not researcher or researcher == "None" or researcher == "no_research":
-                research = ""
-            else:
-                research = await self.get_llm("researcher", "llm").invoke(prompt)
-
-            logger.info(f"Found Research for URL {question.page_url}:\n{research}")
-            return research
+                        async with self._concurrency_limiter:
+                            import requests
+                
+                            # Step 1: Get free news from GDELT
+                            gdelt_context = ""
+                            try:
+                                query = question.question_text[:100].replace(" ", "%20")
+                                gdelt_url = f"https://api.gdeltproject.org/api/v2/doc/doc?query={query}&mode=ArtList&maxrecords=10&format=json"
+                                gdelt_response = requests.get(gdelt_url, timeout=15)
+                                if gdelt_response.status_code == 200:
+                                    gdelt_data = gdelt_response.json()
+                                    articles = gdelt_data.get("articles", [])
+                                    gdelt_context = "\n".join([
+                                        f"- {a.get('title', 'No title')} (Source: {a.get('domain', 'Unknown')}, Date: {a.get('seendate', 'Unknown')})"
+                                        for a in articles[:10]
+                                    ])
+                                    if gdelt_context:
+                                        gdelt_context = f"\n\nRecent news articles from GDELT:\n{gdelt_context}"
+                            except Exception as e:
+                                logger.warning(f"GDELT search failed: {e}")
+                                gdelt_context = ""
+                
+                            # Step 2: Send research prompt to LLM with GDELT context
+                            prompt = clean_indents(
+                                f"""
+                                You are an assistant to a superforecaster.
+                                The superforecaster will give you a question they intend to forecast on.
+                                To be a great assistant, you generate a concise but detailed rundown of the most relevant news, including if the question would resolve Yes or No based on current information.
+                                You do not produce forecasts yourself.
+                
+                                Question:
+                                {question.question_text}
+                
+                                This question's outcome will be determined by the specific criteria below:
+                                {question.resolution_criteria}
+                
+                                {question.fine_print}
+                                {gdelt_context}
+                                """
+                            )
+                
+                            researcher = self.get_llm("researcher")
+                            if isinstance(researcher, GeneralLlm):
+                                research = await researcher.invoke(prompt)
+                            elif (
+                                researcher == "asknews/news-summaries"
+                                or researcher == "asknews/deep-research/low-depth"
+                                or researcher == "asknews/deep-research/medium-depth"
+                                or researcher == "asknews/deep-research/high-depth"
+                            ):
+                                research = await AskNewsSearcher().call_preconfigured_version(
+                                    researcher, prompt
+                                )
+                            elif researcher.startswith("smart-searcher"):
+                                model_name = researcher.removeprefix("smart-searcher/")
+                                searcher = SmartSearcher(
+                                    model=model_name,
+                                    temperature=0,
+                                    num_searches_to_run=2,
+                                    num_sites_per_search=10,
+                                    use_advanced_filters=False,
+                                )
+                                research = await searcher.invoke(prompt)
+                            elif not researcher or researcher == "None" or researcher == "no_research":
+                                research = ""
+                            else:
+                                research = await self.get_llm("researcher", "llm").invoke(prompt)
+                
+                            logger.info(f"Found Research for URL {question.page_url}:\n{research}")
+                            return research
 
     ##################################### BINARY QUESTIONS #####################################
 
