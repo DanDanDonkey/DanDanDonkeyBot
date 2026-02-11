@@ -35,92 +35,19 @@ dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
 
 
-class SpringTemplateBot2026(ForecastBot):
+class DanDanDonkeyBot(ForecastBot):
     """
-    This is the template bot for Spring 2026 Metaculus AI Tournament.
-    This is a copy of what is used by Metaculus to run the Metac Bots in our benchmark, provided as a template for new bot makers.
-    This template is given as-is, and is use-at-your-own-risk.
-    We have covered most test cases in forecasting-tools it may be worth double checking key components locally.
-    So far our track record has been 1 mentionable bug per season (affecting forecasts for 1-2% of total questions)
-
-    Main changes since Fall:
-    - Additional prompting has been added to numeric questions to emphasize putting pecentile values in the correct order.
-    - Support for conditional and date questions has been added
-    - Note: Spring AIB will not use date/conditional questions, so these are only for forecasting on the main site as you wish.
-
-    The main entry point of this bot is `bot.forecast_on_tournament(tournament_id)` in the parent class.
-    See the script at the bottom of the file for more details on how to run the bot.
-    Ignoring the finer details, the general flow is:
-    - Load questions from Metaculus
-    - For each question
-        - Execute run_research a number of times equal to research_reports_per_question
-        - Execute respective run_forecast function `predictions_per_research_report * research_reports_per_question` times
-        - Aggregate the predictions
-        - Submit prediction (if publish_reports_to_metaculus is True)
-    - Return a list of ForecastReport objects
-
-    Alternatively, you can use the MetaculusClient to make a custom filter of questions to forecast on
-    and forecast them with `bot.forecast_questions(questions)`
-
-    Only the research and forecast functions need to be implemented in ForecastBot subclasses,
-    though you may want to override other ForecastBot functions.
-    In this example, you can change the prompts to be whatever you want since,
-    structure_output uses an LLM to intelligently reformat the output into the needed structure.
-
-    By default (i.e. 'tournament' mode), when you run this script, it will forecast on any open questions in the
-    primary bot tournament and MiniBench. If you want to forecast on only one or the other, you can remove one
-    of them from the 'tournament' mode code at the bottom of the file.
-
-    You can experiment with what models work best with your bot by using the `llms` parameter when initializing the bot.
-    You can initialize the bot with any number of models. For example,
-    ```python
-    my_bot = MyBot(
-        ...
-        llms={  # choose your model names or GeneralLlm llms here, otherwise defaults will be chosen for you
-            "default": GeneralLlm(
-                model="openrouter/openai/gpt-4o", # "anthropic/claude-sonnet-4-20250514", etc (see docs for litellm)
-                temperature=0.3,
-                timeout=40,
-                allowed_tries=2,
-            ),
-            "summarizer": "openai/gpt-4o-mini",
-            "researcher": "asknews/news-summaries",
-            "parser": "openai/gpt-4o-mini",
-        },
-    )
-    ```
-
-    Then you can access the model in custom functions like this:
-    ```python
-    research_strategy = self.get_llm("researcher", "model_name"
-    if research_strategy == "asknews/news-summaries":
-        ...
-    # OR
-    summarizer = await self.get_llm("summarizer", "llm").invoke(prompt)
-    # OR
-    reasoning = await self.get_llm("default", "llm").invoke(prompt)
-    ```
-
-    If you end up having trouble with rate limits and want to try a more sophisticated rate limiter try:
-    ```python
-    from forecasting_tools import RefreshingBucketRateLimiter
-    rate_limiter = RefreshingBucketRateLimiter(
-        capacity=2,
-        refresh_rate=1,
-    ) # Allows 1 request per second on average with a burst of 2 requests initially. Set this as a class variable
-    await self.rate_limiter.wait_till_able_to_acquire_resources(1) # 1 because it's consuming 1 request (use more if you are adding a token limit)
-    ```
-    Additionally OpenRouter has large rate limits immediately on account creation
+    DanDanDonkeyBot - AI forecasting bot for Metaculus tournaments.
+    Based on the Spring 2026 template with GDELT news integration.
     """
 
-    _max_concurrent_questions = (
-        1  # Set this to whatever works for your search-provider/ai-model rate limits
-    )
+    _max_concurrent_questions = 1
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
     _structure_output_validation_samples = 2
 
     ##################################### RESEARCH #####################################
-async def run_research(self, question: MetaculusQuestion) -> str:
+
+    async def run_research(self, question: MetaculusQuestion) -> str:
         async with self._concurrency_limiter:
             import requests
 
@@ -603,7 +530,6 @@ async def run_research(self, question: MetaculusQuestion) -> str:
             and previous_forecasts
             and question_type not in self.force_reforecast_in_conditional
         ):
-            # TODO: add option to not affirm current parent/child forecasts, create new forecast
             previous_forecast = previous_forecasts[-1]
             current_utc_time = datetime.now(timezone.utc)
             if (
@@ -669,7 +595,7 @@ if __name__ == "__main__":
     litellm_logger.propagate = False
 
     parser = argparse.ArgumentParser(
-        description="Run the TemplateBot forecasting system"
+        description="Run DanDanDonkeyBot forecasting system"
     )
     parser.add_argument(
         "--mode",
@@ -686,11 +612,11 @@ if __name__ == "__main__":
         "test_questions",
     ], "Invalid run mode"
 
-    template_bot = SpringTemplateBot2026(
+    danbot = DanDanDonkeyBot(
         research_reports_per_question=1,
         predictions_per_research_report=5,
         use_research_summary_to_forecast=False,
-        publish_reports_to_metaculus=False,  # Keep False until you're ready to submit
+        publish_reports_to_metaculus=False,  # Set True when ready to submit
         folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=True,
         extra_metadata_in_explanation=True,
@@ -714,40 +640,35 @@ if __name__ == "__main__":
 
     client = MetaculusClient()
     if run_mode == "tournament":
-        # You may want to change this to the specific tournament ID you want to forecast on
         seasonal_tournament_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
+            danbot.forecast_on_tournament(
                 client.CURRENT_AI_COMPETITION_ID, return_exceptions=True
             )
         )
         minibench_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
+            danbot.forecast_on_tournament(
                 client.CURRENT_MINIBENCH_ID, return_exceptions=True
             )
         )
         forecast_reports = seasonal_tournament_reports + minibench_reports
     elif run_mode == "metaculus_cup":
-        # The Metaculus cup is a good way to test the bot's performance on regularly open questions. You can also use AXC_2025_TOURNAMENT_ID = 32564 or AI_2027_TOURNAMENT_ID = "ai-2027"
-        # The Metaculus cup may not be initialized near the beginning of a season (i.e. January, May, September)
-        template_bot.skip_previously_forecasted_questions = False
+        danbot.skip_previously_forecasted_questions = False
         forecast_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
+            danbot.forecast_on_tournament(
                 client.CURRENT_METACULUS_CUP_ID, return_exceptions=True
             )
         )
     elif run_mode == "test_questions":
-        # Example questions are a good way to test the bot's performance on a single question
         EXAMPLE_QUESTIONS = [
-            "https://www.metaculus.com/questions/578/human-extinction-by-2100/",  # Human Extinction - Binary
-            "https://www.metaculus.com/questions/22427/number-of-new-leading-ai-labs/",  # Number of New Leading AI Labs - Multiple Choice
-            "https://www.metaculus.com/c/diffusion-community/38880/how-many-us-labor-strikes-due-to-ai-in-2029/",  # Number of US Labor Strikes Due to AI in 2029 - Discrete
+            "https://www.metaculus.com/questions/578/human-extinction-by-2100/",  # Binary
+            "https://www.metaculus.com/questions/22427/number-of-new-leading-ai-labs/",  # Multiple Choice
         ]
-        template_bot.skip_previously_forecasted_questions = False
+        danbot.skip_previously_forecasted_questions = False
         questions = [
             client.get_question_by_url(question_url)
             for question_url in EXAMPLE_QUESTIONS
         ]
         forecast_reports = asyncio.run(
-            template_bot.forecast_questions(questions, return_exceptions=True)
+            danbot.forecast_questions(questions, return_exceptions=True)
         )
-    template_bot.log_report_summary(forecast_reports)
+    danbot.log_report_summary(forecast_reports)
