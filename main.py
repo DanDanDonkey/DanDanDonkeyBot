@@ -783,9 +783,10 @@ if __name__ == "__main__":
         forecast_reports = asyncio.run(danbot.forecast_on_tournament(client.CURRENT_METACULUS_CUP_ID, return_exceptions=True))
     elif run_mode == "test_questions":
         EXAMPLE_QUESTIONS = [
-            "https://www.metaculus.com/questions/578/human-extinction-by-2100/",
-            "https://www.metaculus.com/questions/22427/number-of-new-leading-ai-labs/",
-        ]
+    "https://www.metaculus.com/questions/578/human-extinction-by-2100/",
+    "https://www.metaculus.com/questions/22427/number-of-new-leading-ai-labs/",
+    "https://www.metaculus.com/questions/25523/nigel-farage-uk-pm-before-jan-1-2035/",
+]
         danbot.skip_previously_forecasted_questions = False
         questions = [client.get_question_by_url(url) for url in EXAMPLE_QUESTIONS]
         forecast_reports = asyncio.run(danbot.forecast_questions(questions, return_exceptions=True))
