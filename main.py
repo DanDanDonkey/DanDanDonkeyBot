@@ -146,6 +146,30 @@ async def fetch_web_search(query: str, max_results: int = 5) -> str:
     except Exception as e:
         return f"(Web search failed: {e})"
 
+        
+        async def fetch_reddit_context(query: str, subreddits: list = None) -> str:
+    """Search Reddit for relevant discussion. No API key needed."""
+    try:
+        import requests
+        if not subreddits:
+            subreddits = ["worldnews", "geopolitics", "ukpolitics", "economics"]
+        results = []
+        for sub in subreddits[:3]:
+            url = f"https://www.reddit.com/r/{sub}/search.json"
+            params = {"q": query[:100], "sort": "relevance", "limit": 5, "t": "month"}
+            headers = {"User-Agent": "DanDanDonkeyBot/1.0"}
+            r = requests.get(url, params=params, headers=headers, timeout=10)
+            if r.status_code == 200:
+                posts = r.json().get("data", {}).get("children", [])
+                for p in posts[:3]:
+                    d = p["data"]
+                    results.append(f"- [{d['subreddit']}] {d['title']} (score: {d['score']})")
+        if not results:
+            return ""
+        return "## Reddit Discussion\n" + "\n".join(results)
+    except Exception as e:
+        return ""
+
 
 def fetch_fred_data(query_text: str) -> str:
     api_key = os.environ.get("FRED_API_KEY", "")
@@ -354,8 +378,9 @@ class DanDanDonkeyBot(ForecastBot):
             # Gather all free data sources
             sources = [
                 fetch_metaculus_community(question),
-                fetch_web_search(q_text),
                 fetch_polymarket_data(q_text),
+                fetch_web_search(q_text),
+                fetch_reddit_context(q_text),
                 fetch_gdelt_articles(q_text),
                 fetch_fred_data(q_text),
                 fetch_world_bank_data(q_text),
