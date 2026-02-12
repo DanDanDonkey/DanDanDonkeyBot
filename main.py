@@ -133,7 +133,7 @@ def fetch_metaculus_community(question: MetaculusQuestion) -> str:
     return ""
 
 
-async def fetch_web_search(query: str, max_results: int = 5) -> str:
+def fetch_web_search(query: str, max_results: int = 5) -> str:
     """Free web search via DuckDuckGo — no API key needed."""
     try:
         from duckduckgo_search import DDGS
@@ -149,7 +149,7 @@ async def fetch_web_search(query: str, max_results: int = 5) -> str:
         return f"(Web search failed: {e})"
 
         
-async def fetch_reddit_context(query: str, subreddits: list = None) -> str:
+def fetch_reddit_context(query: str, subreddits: list = None) -> str:
     """Search Reddit for relevant discussion. No API key needed."""
     try:
         import requests
