@@ -131,6 +131,20 @@ def fetch_metaculus_community(question: MetaculusQuestion) -> str:
     except Exception:
         pass
     return ""
+async def fetch_web_search(query: str, max_results: int = 5) -> str:
+    """Free web search via DuckDuckGo — no API key needed."""
+    try:
+        from duckduckgo_search import DDGS
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=max_results))
+        if not results:
+            return ""
+        output = "## Web Search Results\n"
+        for r in results:
+            output += f"- **{r['title']}**: {r['body']}\n  Source: {r['href']}\n"
+        return output
+    except Exception as e:
+        return f"(Web search failed: {e})"
 
 
 def fetch_fred_data(query_text: str) -> str:
@@ -340,6 +354,7 @@ class DanDanDonkeyBot(ForecastBot):
             # Gather all free data sources
             sources = [
                 fetch_metaculus_community(question),
+                fetch_web_search(q_text),
                 fetch_polymarket_data(q_text),
                 fetch_gdelt_articles(q_text),
                 fetch_fred_data(q_text),
