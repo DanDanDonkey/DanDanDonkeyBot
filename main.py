@@ -395,6 +395,8 @@ class DanDanDonkeyBot(ForecastBot):
                 fetch_who_health_data(q_text),
                 fetch_wikipedia_context(q_text),
                 fetch_media_trend(q_text),
+                fetch_sec_company_info(q_text),
+                fetch_sec_filings(q_text),
             ]
             external_data = "\n\n".join(s for s in sources if s)
             if not external_data:
