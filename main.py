@@ -32,6 +32,9 @@ from forecasting_tools import (
     structure_output,
 )
 
+# Import debiasing module
+from debiasing_layer import debias_all_forecasters, analyze_bias_patterns, format_debiasing_summary
+
 dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
 
@@ -787,6 +790,64 @@ class DanDanDonkeyBot(ForecastBot):
             You are forecasting the CHILD question given the parent's resolution.
             Never re-forecast the parent question.
         """)
+    
+    async def _generate_debiased_ensemble(self, question_text: str, base_prompt: str, num_forecasts: int = 5) -> tuple[float, dict]:
+        """
+        Generate multiple forecasts and apply debiasing to get final prediction.
+        Returns: (final_prediction, bias_analysis)
+        """
+        logger.info(f"Generating {num_forecasts} forecasts with debiasing for: {question_text[:100]}")
+        
+        # Generate multiple independent forecasts
+        raw_forecasts = []
+        for i in range(num_forecasts):
+            try:
+                # Add some randomness to temperature for diversity
+                temp_llm = self.get_llm("default", "llm")
+                response = await temp_llm.invoke(base_prompt + f"\n\n(This is forecast {i+1} of {num_forecasts})")
+                
+                # Extract probability from response (you'll need to parse based on your prompt format)
+                import re
+                match = re.search(r'(\d+\.?\d*)\s*%', response)
+                if match:
+                    prob = float(match.group(1))
+                    raw_forecasts.append({
+                        'prediction': prob,
+                        'reasoning': response[:2000]  # Truncate for efficiency
+                    })
+                else:
+                    logger.warning(f"Could not parse forecast {i+1}, skipping")
+            except Exception as e:
+                logger.error(f"Error generating forecast {i+1}: {e}")
+        
+        if not raw_forecasts:
+            logger.error("No valid forecasts generated, returning 50%")
+            return 50.0, {}
+        
+        # Apply debiasing layer
+        try:
+            from debiasing_layer import debias_all_forecasters, analyze_bias_patterns, format_debiasing_summary
+            
+            debiased_forecasts = await debias_all_forecasters(
+                raw_forecasts,
+                question_text,
+                self.get_llm("default", "llm")
+            )
+            
+            # Aggregate debiased predictions
+            adjusted_predictions = [f['adjusted_prediction'] for f in debiased_forecasts]
+            final_prediction = sum(adjusted_predictions) / len(adjusted_predictions)
+            
+            # Analyze bias patterns for logging
+            bias_analysis = analyze_bias_patterns(debiased_forecasts)
+            logger.info(f"\n{format_debiasing_summary(bias_analysis)}")
+            
+            return final_prediction, bias_analysis
+            
+        except Exception as e:
+            logger.error(f"Debiasing failed: {e}, falling back to simple average")
+            raw_predictions = [f['prediction'] for f in raw_forecasts]
+            return sum(raw_predictions) / len(raw_predictions), {}
 
 
 if __name__ == "__main__":
