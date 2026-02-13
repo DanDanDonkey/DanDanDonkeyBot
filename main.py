@@ -6,7 +6,7 @@ import dotenv
 from typing import Literal
 import json
 import os
-
+from typing import Literal, Dict
 from forecasting_tools import (
     AskNewsSearcher,
     BinaryQuestion,
@@ -34,7 +34,7 @@ from forecasting_tools import (
 
 # Import debiasing module
 from debiasing_layer import debias_all_forecasters, analyze_bias_patterns, format_debiasing_summary
-
+from question_decomposer import decompose_and_forecast, format_decomposition_summary
 dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
 
@@ -364,7 +364,6 @@ def fetch_media_trend(query_text: str) -> str:
 ###############################################################################
 # MAIN BOT CLASS
 ###############################################################################
-
 class DanDanDonkeyBot(ForecastBot):
     """
     DanDanDonkeyBot v2 - with inside/outside view research and multi-source data.
@@ -375,7 +374,11 @@ class DanDanDonkeyBot(ForecastBot):
     _max_concurrent_questions = 1
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
     _structure_output_validation_samples = 2
+    
+    # Add this line:
+    use_decomposition = True  # Set to False to disable question decomposition
 
+    
     async def run_research(self, question: MetaculusQuestion) -> str:
         async with self._concurrency_limiter:
             q_text = question.question_text
@@ -390,7 +393,6 @@ class DanDanDonkeyBot(ForecastBot):
                 fetch_fred_data(q_text),
                 fetch_world_bank_data(q_text),
                 fetch_who_health_data(q_text),
-                fetch_acled_conflict_data(q_text),
                 fetch_wikipedia_context(q_text),
                 fetch_media_trend(q_text),
             ]
@@ -439,7 +441,7 @@ class DanDanDonkeyBot(ForecastBot):
                 - Brief overall assessment integrating both views
                 - Do NOT give a probability
 
-                Be concise. Cite specific data from the external data above.
+                Be concise. Cite specific data from the external data above. If there is uncertainty in data, state this and do NOT make up evidence.
                 """
             )
 
@@ -509,6 +511,18 @@ class DanDanDonkeyBot(ForecastBot):
             The last thing you write is your final answer as: "Probability: ZZ%", 0-100
             """
         )
+        if self.use_decomposition and len(question.question_text.split()) > 15:
+            try:
+                decomp = await self._forecast_with_decomposition(
+                    question.question_text, "binary", research
+                )
+                logger.info(f"\n{'='*60}")
+                logger.info(f"DECOMPOSITION FORECAST: {decomp['prediction']:.1f}%")
+                logger.info(f"{'='*60}")
+                logger.info(decomp['reasoning'])
+                logger.info(f"{'='*60}\n")
+            except Exception as e:
+                logger.warning(f"Decomposition failed: {e}")
         return await self._binary_prompt_to_forecast(question, prompt)
 
     async def _binary_prompt_to_forecast(self, question: BinaryQuestion, prompt: str) -> ReasonedPrediction[float]:
@@ -849,7 +863,52 @@ class DanDanDonkeyBot(ForecastBot):
             raw_predictions = [f['prediction'] for f in raw_forecasts]
             return sum(raw_predictions) / len(raw_predictions), {}
 
+    async def _forecast_with_decomposition(
+        self, 
+        question_text: str,
+        question_type: str,
+        research: str
+    ) -> Dict:
+        """Use question decomposition for complex questions."""
+        try:
+            decomp_result = await decompose_and_forecast(
+                question_text=question_text,
+                question_type=question_type,
+                research_context=research,
+                llm_client=self.get_llm("default", "llm"),
+                max_subquestions=5
+            )
+            
+            logger.info(f"\n{format_decomposition_summary(decomp_result)}")
+            
+            prediction = decomp_result['final_forecast']
+            
+            reasoning = "=== Question Decomposition Analysis ===\n\n"
+            reasoning += f"Method: {decomp_result['combination_method']}\n\n"
+            reasoning += "Sub-question forecasts:\n"
+            
+            for i, sf in enumerate(decomp_result['subforecasts'], 1):
+                reasoning += f"\n{i}. {sf['subquestion']}\n"
+                reasoning += f"   Estimate: {sf['estimate']:.1f}%\n"
+                reasoning += f"   Confidence: {sf['confidence']}\n"
+            
+            reasoning += f"\n\nCombined forecast: {prediction:.1f}%\n"
+            
+            return {
+                'prediction': prediction,
+                'reasoning': reasoning,
+                'decomposition_details': decomp_result
+            }
+            
+        except Exception as e:
+            logger.error(f"Decomposition failed: {e}")
+            return {
+                'prediction': 50.0,
+                'reasoning': f"Decomposition failed: {str(e)}",
+                'decomposition_details': None
+            }
 
+            
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
     logging.getLogger("LiteLLM").setLevel(logging.WARNING)
