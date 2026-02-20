@@ -37,6 +37,9 @@ from forecasting_tools import (
 dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
 
+PERSONAL_OPENROUTER_KEY = os.environ.get("PERSONAL_OPENROUTER_API_KEY")
+METACULUS_OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY")
+
 ###############################################################################
 # ENSEMBLE HELPERS
 ###############################################################################
@@ -92,6 +95,23 @@ def _extract_community_float(question: MetaculusQuestion) -> Optional[float]:
 ###############################################################################
 # FREE DATA SOURCE HELPERS
 ###############################################################################
+
+async def fetch_perplexity(query: str) -> str:
+    try:
+        llm = GeneralLlm(
+            model="perplexity/sonar",
+            api_key=PERSONAL_OPENROUTER_KEY,
+            temperature=0.2,
+            timeout=60,
+            allowed_tries=2,
+        )
+        result = await llm.invoke(
+            f"Give a concise research summary relevant to this forecasting question: {query}"
+        )
+        return f"**Perplexity Search:**\n{result[:1000]}"
+    except Exception as e:
+        logger.warning(f"Perplexity fetch failed: {e}")
+        return ""
 
 def _safe_get(url: str, timeout: int = 12, params: dict = None) -> dict | list | None:
     import requests
@@ -395,7 +415,14 @@ def fetch_sec_filings(query_text: str) -> str:
 
 async def _call_model(model_id: str, prompt: str, temperature: float = 0.3) -> str:
     try:
-        llm = GeneralLlm(model=model_id, temperature=temperature, timeout=120, allowed_tries=2)
+        use_personal = model_id.startswith("perplexity/")
+        llm = GeneralLlm(
+            model=model_id,
+            temperature=temperature,
+            timeout=120,
+            allowed_tries=2,
+            api_key=PERSONAL_OPENROUTER_KEY if use_personal else None,
+        )
         return await llm.invoke(prompt)
     except Exception as e:
         logger.warning(f"Model {model_id} failed: {e}")
@@ -528,6 +555,7 @@ class DanDanDonkeyBot(ForecastBot):
     async def run_research(self, question: MetaculusQuestion) -> str:
         async with self._concurrency_limiter:
             q_text = question.question_text
+            perplexity_data = await fetch_perplexity(q_text)
             sources = [
                 fetch_metaculus_community(question),
                 fetch_polymarket_data(q_text),
@@ -542,6 +570,7 @@ class DanDanDonkeyBot(ForecastBot):
                 fetch_media_trend(q_text),
                 fetch_sec_company_info(q_text),
                 fetch_sec_filings(q_text),
+                fetch_perplexity(q_text),
             ]
             external_data = "\n\n".join(s for s in sources if s) or "(No external data.)"
 
