@@ -1,12 +1,15 @@
 import argparse
 import asyncio
 import logging
+import math
+import re
 from datetime import datetime, timezone
+from typing import Dict, List, Literal, Optional
+
 import dotenv
-from typing import Literal
 import json
 import os
-from typing import Literal, Dict
+
 from forecasting_tools import (
     AskNewsSearcher,
     BinaryQuestion,
@@ -22,7 +25,6 @@ from forecasting_tools import (
     Percentile,
     ConditionalQuestion,
     ConditionalPrediction,
-    PredictionTypes,
     PredictionAffirmed,
     BinaryPrediction,
     PredictedOptionList,
@@ -32,12 +34,60 @@ from forecasting_tools import (
     structure_output,
 )
 
-# Import debiasing module
-from debiasing_layer import debias_all_forecasters, analyze_bias_patterns, format_debiasing_summary
-from question_decomposer import decompose_and_forecast, format_decomposition_summary
 dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
 
+###############################################################################
+# ENSEMBLE HELPERS
+###############################################################################
+
+ENSEMBLE_MODELS = {
+    "DeepSeek-R1":      "openrouter/deepseek/deepseek-r1",
+    "DeepSeek-V3":      "openrouter/deepseek/deepseek-chat",
+    "Mistral-Small":    "openrouter/mistralai/mistral-small-3.1-24b-instruct:free",
+    "Claude-Sonnet":    "anthropic/claude-sonnet-4-6",
+}
+
+EXTREMIZATION_ALPHA = 1.2
+
+COMMUNITY_WEIGHT = 0.40
+
+def _parse_probability(text: str) -> Optional[float]:
+    matches = re.findall(r'[Pp]robability[:\s]+(\d+\.?\d*)\s*%', text)
+    if matches:
+        return max(0.01, min(0.99, float(matches[-1]) / 100))
+    matches = re.findall(r'\b(\d+\.?\d*)\s*%', text)
+    if matches:
+        return max(0.01, min(0.99, float(matches[-1]) / 100))
+    return None
+
+def extremize_log_odds(probabilities: List[float], alpha: float = EXTREMIZATION_ALPHA) -> float:
+    if not probabilities:
+        return 0.5
+    clipped = [max(0.02, min(0.98, p)) for p in probabilities]
+    log_odds = [math.log(p / (1 - p)) for p in clipped]
+    avg_log_odds = sum(log_odds) / len(log_odds)
+    extremized = alpha * avg_log_odds
+    return max(0.01, min(0.99, 1 / (1 + math.exp(-extremized))))
+
+def community_anchored_blend(model_pred: float, community_pred: Optional[float]) -> float:
+    if community_pred is None:
+        return model_pred
+    blended = (1 - COMMUNITY_WEIGHT) * model_pred + COMMUNITY_WEIGHT * community_pred
+    logger.info(
+        f"  Community blend: ensemble={model_pred:.3f}, community={community_pred:.3f} "
+        f"→ {blended:.3f} (weight={COMMUNITY_WEIGHT})"
+    )
+    return max(0.01, min(0.99, blended))
+
+def _extract_community_float(question: MetaculusQuestion) -> Optional[float]:
+    try:
+        cp = question.community_prediction
+        if isinstance(cp, float):
+            return max(0.02, min(0.98, cp))
+    except Exception:
+        pass
+    return None
 
 ###############################################################################
 # FREE DATA SOURCE HELPERS
@@ -53,56 +103,38 @@ def _safe_get(url: str, timeout: int = 12, params: dict = None) -> dict | list |
         logger.warning(f"HTTP request failed for {url[:80]}: {e}")
     return None
 
-
 def fetch_gdelt_articles(query_text: str, max_articles: int = 8) -> str:
     import requests
     try:
         clean_query = query_text[:80].replace('"', '').replace("'", "")
-        params = {
-            "query": clean_query,
-            "mode": "ArtList",
-            "maxrecords": str(max_articles),
-            "format": "json",
-            "sort": "DateDesc",
-        }
+        params = {"query": clean_query, "mode": "ArtList", "maxrecords": str(max_articles),
+                  "format": "json", "sort": "DateDesc"}
         resp = requests.get("https://api.gdeltproject.org/api/v2/doc/doc", params=params, timeout=15)
         if resp.status_code != 200:
             return ""
-        content_type = resp.headers.get("Content-Type", "")
-        if "json" not in content_type and "javascript" not in content_type:
+        if "json" not in resp.headers.get("Content-Type", "") and "javascript" not in resp.headers.get("Content-Type", ""):
             return ""
         data = resp.json()
         articles = data.get("articles", [])
         if not articles:
             return ""
-        lines = []
-        for a in articles[:max_articles]:
-            title = a.get("title", "No title")
-            source = a.get("domain", "Unknown")
-            date = a.get("seendate", "Unknown")[:10]
-            lines.append(f"  - {title} ({source}, {date})")
+        lines = [f"  - {a.get('title','No title')} ({a.get('domain','?')}, {a.get('seendate','?')[:10]})"
+                 for a in articles[:max_articles]]
         return "**Recent News (GDELT):**\n" + "\n".join(lines)
     except Exception as e:
         logger.warning(f"GDELT fetch failed: {e}")
         return ""
 
-
 def fetch_polymarket_data(query_text: str) -> str:
     try:
-        keywords = " ".join(query_text.split()[:5])
-        data = _safe_get(
-            "https://gamma-api.polymarket.com/markets",
-            params={"_limit": "5", "closed": "false", "order": "volume24hr",
-                    "ascending": "false", "title_contains": keywords},
-        )
-        if not data or not isinstance(data, list) or len(data) == 0:
-            keywords = " ".join(query_text.split()[:3])
-            data = _safe_get(
-                "https://gamma-api.polymarket.com/markets",
-                params={"_limit": "5", "closed": "false", "order": "volume24hr",
-                        "ascending": "false", "title_contains": keywords},
-            )
-        if not data or not isinstance(data, list) or len(data) == 0:
+        for n_words in [5, 3]:
+            keywords = " ".join(query_text.split()[:n_words])
+            data = _safe_get("https://gamma-api.polymarket.com/markets",
+                             params={"_limit": "5", "closed": "false", "order": "volume24hr",
+                                     "ascending": "false", "title_contains": keywords})
+            if data and isinstance(data, list) and len(data):
+                break
+        if not data or not isinstance(data, list):
             return ""
         lines = []
         for m in data[:5]:
@@ -116,274 +148,386 @@ def fetch_polymarket_data(query_text: str) -> str:
                 price_str = ", ".join(f"{o}: {float(p)*100:.0f}%" for o, p in zip(outcomes, prices))
             except Exception:
                 price_str = str(prices_raw)
-            lines.append(f"  - {title} -> {price_str} (24h vol: ${float(vol):,.0f})")
+            lines.append(f"  - {title} → {price_str} (24h vol: ${float(vol):,.0f})")
         return "**Prediction Markets (Polymarket):**\n" + "\n".join(lines)
     except Exception as e:
         logger.warning(f"Polymarket fetch failed: {e}")
         return ""
 
-
 def fetch_metaculus_community(question: MetaculusQuestion) -> str:
     try:
         cp = question.community_prediction
         if cp is not None:
-            if isinstance(cp, float):
-                return f"**Metaculus Community Prediction:** {cp*100:.1f}%"
-            else:
-                return f"**Metaculus Community Prediction:** {cp}"
+            val = f"{cp*100:.1f}%" if isinstance(cp, float) else str(cp)
+            return f"**Metaculus Community Prediction:** {val}  ← STRONG PRIOR from many calibrated forecasters"
     except Exception:
         pass
     return ""
 
-
 def fetch_web_search(query: str, max_results: int = 5) -> str:
-    """Free web search via DuckDuckGo — no API key needed."""
     try:
         from duckduckgo_search import DDGS
         with DDGS() as ddgs:
             results = list(ddgs.text(query, max_results=max_results))
         if not results:
             return ""
-        output = "## Web Search Results\n"
+        out = "## Web Search Results\n"
         for r in results:
-            output += f"- **{r['title']}**: {r['body']}\n  Source: {r['href']}\n"
-        return output
+            out += f"- **{r['title']}**: {r['body']}\n  Source: {r['href']}\n"
+        return out
     except Exception as e:
-        return f"(Web search failed: {e})"
+        return f"(Web search unavailable: {e})"
 
-        
 def fetch_reddit_context(query: str, subreddits: list = None) -> str:
-    """Search Reddit for relevant discussion. No API key needed."""
     try:
         import requests
-        if not subreddits:
-            subreddits = ["worldnews", "geopolitics", "ukpolitics", "economics"]
+        subreddits = subreddits or ["worldnews", "geopolitics", "ukpolitics", "economics"]
         results = []
         for sub in subreddits[:3]:
-            url = f"https://www.reddit.com/r/{sub}/search.json"
-            params = {"q": query[:100], "sort": "relevance", "limit": 5, "t": "month"}
-            headers = {"User-Agent": "DanDanDonkeyBot/1.0"}
-            r = requests.get(url, params=params, headers=headers, timeout=10)
+            r = requests.get(f"https://www.reddit.com/r/{sub}/search.json",
+                             params={"q": query[:100], "sort": "relevance", "limit": 5, "t": "month"},
+                             headers={"User-Agent": "DanDanDonkeyBot/1.0"}, timeout=10)
             if r.status_code == 200:
-                posts = r.json().get("data", {}).get("children", [])
-                for p in posts[:3]:
+                for p in r.json().get("data", {}).get("children", [])[:3]:
                     d = p["data"]
                     results.append(f"- [{d['subreddit']}] {d['title']} (score: {d['score']})")
-        if not results:
-            return ""
-        return "## Reddit Discussion\n" + "\n".join(results)
-    except Exception as e:
+        return ("## Reddit Discussion\n" + "\n".join(results)) if results else ""
+    except Exception:
         return ""
-
 
 def fetch_fred_data(query_text: str) -> str:
     api_key = os.environ.get("FRED_API_KEY", "")
     if not api_key:
         return ""
     try:
-        data = _safe_get(
-            "https://api.stlouisfed.org/fred/series/search",
-            params={"search_text": query_text[:60], "api_key": api_key,
-                    "file_type": "json", "limit": "3", "order_by": "popularity", "sort_order": "desc"},
-        )
+        data = _safe_get("https://api.stlouisfed.org/fred/series/search",
+                         params={"search_text": query_text[:60], "api_key": api_key,
+                                 "file_type": "json", "limit": "3",
+                                 "order_by": "popularity", "sort_order": "desc"})
         if not data or "seriess" not in data:
             return ""
         lines = []
         for series in data["seriess"][:3]:
-            series_id = series.get("id", "")
-            title = series.get("title", "")
-            obs_data = _safe_get(
-                "https://api.stlouisfed.org/fred/series/observations",
-                params={"series_id": series_id, "api_key": api_key,
-                        "file_type": "json", "sort_order": "desc", "limit": "1"},
-            )
-            if obs_data and "observations" in obs_data and obs_data["observations"]:
-                obs = obs_data["observations"][0]
-                lines.append(f"  - {title} ({series_id}): {obs.get('value', 'N/A')} (as of {obs.get('date', 'N/A')})")
+            sid = series.get("id", "")
+            obs = _safe_get("https://api.stlouisfed.org/fred/series/observations",
+                            params={"series_id": sid, "api_key": api_key,
+                                    "file_type": "json", "sort_order": "desc", "limit": "1"})
+            if obs and obs.get("observations"):
+                o = obs["observations"][0]
+                lines.append(f"  - {series.get('title','')} ({sid}): {o.get('value','N/A')} ({o.get('date','?')})")
         return ("**Economic Data (FRED):**\n" + "\n".join(lines)) if lines else ""
     except Exception as e:
         logger.warning(f"FRED fetch failed: {e}")
         return ""
 
-
 def fetch_world_bank_data(query_text: str) -> str:
+    keyword_to_indicators = {
+        "gdp": "NY.GDP.MKTP.CD", "population": "SP.POP.TOTL",
+        "inflation": "FP.CPI.TOTL.ZG", "unemployment": "SL.UEM.TOTL.ZS",
+        "poverty": "SI.POV.DDAY", "life expectancy": "SP.DYN.LE00.IN",
+        "co2": "EN.ATM.CO2E.PC", "emissions": "EN.ATM.CO2E.PC",
+        "trade": "NE.TRD.GNFS.ZS", "debt": "GC.DOD.TOTL.GD.ZS",
+        "education": "SE.ADT.LITR.ZS", "mortality": "SP.DYN.IMRT.IN",
+        "energy": "EG.USE.PCAP.KG.OE", "renewable": "EG.FEC.RNEW.ZS",
+    }
+    matched = [(k, v) for k, v in keyword_to_indicators.items() if k in query_text.lower()]
+    if not matched:
+        return ""
     try:
-        keyword_to_indicators = {
-            "gdp": "NY.GDP.MKTP.CD", "population": "SP.POP.TOTL",
-            "inflation": "FP.CPI.TOTL.ZG", "unemployment": "SL.UEM.TOTL.ZS",
-            "poverty": "SI.POV.DDAY", "life expectancy": "SP.DYN.LE00.IN",
-            "co2": "EN.ATM.CO2E.PC", "emissions": "EN.ATM.CO2E.PC",
-            "trade": "NE.TRD.GNFS.ZS", "debt": "GC.DOD.TOTL.GD.ZS",
-            "education": "SE.ADT.LITR.ZS", "mortality": "SP.DYN.IMRT.IN",
-            "energy": "EG.USE.PCAP.KG.OE", "renewable": "EG.FEC.RNEW.ZS",
-        }
-        query_lower = query_text.lower()
-        matched = [(k, v) for k, v in keyword_to_indicators.items() if k in query_lower]
-        if not matched:
-            return ""
         lines = []
         for keyword, indicator in matched[:2]:
-            data = _safe_get(
-                f"https://api.worldbank.org/v2/country/WLD/indicator/{indicator}",
-                params={"format": "json", "per_page": "1", "mrv": "1"},
-            )
+            data = _safe_get(f"https://api.worldbank.org/v2/country/WLD/indicator/{indicator}",
+                             params={"format": "json", "per_page": "1", "mrv": "1"})
             if data and isinstance(data, list) and len(data) > 1 and data[1]:
                 rec = data[1][0]
-                value = rec.get("value")
-                if value is not None:
-                    ind_name = rec.get("indicator", {}).get("value", keyword)
-                    lines.append(f"  - {ind_name}: {value:,.2f} ({rec.get('date', '?')})")
+                if rec.get("value") is not None:
+                    lines.append(f"  - {rec.get('indicator',{}).get('value',keyword)}: {rec['value']:,.2f} ({rec.get('date','?')})")
         return ("**Global Data (World Bank):**\n" + "\n".join(lines)) if lines else ""
     except Exception as e:
         logger.warning(f"World Bank fetch failed: {e}")
         return ""
 
-
 def fetch_wikipedia_context(query_text: str) -> str:
     try:
         keywords = " ".join(query_text.split()[:6])
-        search_data = _safe_get(
-            "https://en.wikipedia.org/w/api.php",
-            params={"action": "query", "list": "search", "srsearch": keywords,
-                    "srlimit": "1", "format": "json"},
-        )
-        if not search_data or "query" not in search_data:
+        search = _safe_get("https://en.wikipedia.org/w/api.php",
+                           params={"action": "query", "list": "search", "srsearch": keywords,
+                                   "srlimit": "1", "format": "json"})
+        if not search or not search.get("query", {}).get("search"):
             return ""
-        results = search_data["query"].get("search", [])
-        if not results:
+        title = search["query"]["search"][0]["title"]
+        extract_data = _safe_get("https://en.wikipedia.org/w/api.php",
+                                 params={"action": "query", "titles": title, "prop": "extracts",
+                                         "exintro": "true", "explaintext": "true", "format": "json"})
+        if not extract_data:
             return ""
-        page_title = results[0]["title"]
-        extract_data = _safe_get(
-            "https://en.wikipedia.org/w/api.php",
-            params={"action": "query", "titles": page_title, "prop": "extracts",
-                    "exintro": "true", "explaintext": "true", "format": "json"},
-        )
-        if not extract_data or "query" not in extract_data:
-            return ""
-        pages = extract_data["query"].get("pages", {})
-        for page_id, page_data in pages.items():
-            extract = page_data.get("extract", "")
+        for _, page in extract_data.get("query", {}).get("pages", {}).items():
+            extract = page.get("extract", "")
             if extract:
-                extract = extract[:500] + ("..." if len(extract) > 500 else "")
-                return f"**Background (Wikipedia - {page_title}):**\n  {extract}"
-        return ""
+                return f"**Background (Wikipedia – {title}):**\n  {extract[:500]}{'...' if len(extract)>500 else ''}"
     except Exception as e:
         logger.warning(f"Wikipedia fetch failed: {e}")
-        return ""
-
+    return ""
 
 def fetch_who_health_data(query_text: str) -> str:
-    health_keywords = ["disease", "health", "pandemic", "virus", "vaccine", "mortality",
-                       "covid", "infection", "epidemic", "WHO", "measles", "malaria",
-                       "tuberculosis", "hiv", "flu", "influenza", "bird flu", "mpox",
-                       "ebola", "cholera", "polio", "death rate", "life expectancy"]
-    if not any(kw in query_text.lower() for kw in health_keywords):
+    health_kws = ["disease", "health", "pandemic", "virus", "vaccine", "mortality",
+                  "covid", "infection", "epidemic", "WHO", "measles", "malaria",
+                  "tuberculosis", "hiv", "flu", "influenza", "bird flu", "mpox",
+                  "ebola", "cholera", "polio", "death rate", "life expectancy"]
+    if not any(kw in query_text.lower() for kw in health_kws):
         return ""
     try:
         keywords = " ".join(query_text.split()[:4])
-        data = _safe_get(
-            "https://ghoapi.azureedge.net/api/Indicator",
-            params={"$filter": f"contains(IndicatorName,'{keywords}')"},
-        )
-        if not data or "value" not in data or not data["value"]:
+        data = _safe_get("https://ghoapi.azureedge.net/api/Indicator",
+                         params={"$filter": f"contains(IndicatorName,'{keywords}')"})
+        if not data or not data.get("value"):
             return ""
         lines = []
         for ind in data["value"][:2]:
-            code = ind.get("IndicatorCode", "")
-            name = ind.get("IndicatorName", "")
-            obs_data = _safe_get(
-                f"https://ghoapi.azureedge.net/api/{code}",
-                params={"$filter": "SpatialDim eq 'GLOBAL'", "$top": "1", "$orderby": "TimeDim desc"},
-            )
-            if obs_data and "value" in obs_data and obs_data["value"]:
-                obs = obs_data["value"][0]
-                lines.append(f"  - {name}: {obs.get('NumericValue', 'N/A')} ({obs.get('TimeDim', '?')})")
+            code, name = ind.get("IndicatorCode", ""), ind.get("IndicatorName", "")
+            obs = _safe_get(f"https://ghoapi.azureedge.net/api/{code}",
+                            params={"$filter": "SpatialDim eq 'GLOBAL'", "$top": "1", "$orderby": "TimeDim desc"})
+            if obs and obs.get("value"):
+                o = obs["value"][0]
+                lines.append(f"  - {name}: {o.get('NumericValue','N/A')} ({o.get('TimeDim','?')})")
             else:
-                lines.append(f"  - {name} (indicator: {code})")
+                lines.append(f"  - {name} ({code})")
         return ("**Global Health (WHO GHO):**\n" + "\n".join(lines)) if lines else ""
     except Exception as e:
         logger.warning(f"WHO GHO fetch failed: {e}")
         return ""
-
 
 def fetch_acled_conflict_data(query_text: str) -> str:
     acled_key = os.environ.get("ACLED_API_KEY", "")
     acled_email = os.environ.get("ACLED_EMAIL", "")
     if not acled_key or not acled_email:
         return ""
-    conflict_keywords = ["war", "conflict", "military", "attack", "violence", "troops",
-                         "invasion", "battle", "ceasefire", "peace", "coup", "protest",
-                         "riot", "insurgent", "terrorism", "rebel", "armed"]
-    if not any(kw in query_text.lower() for kw in conflict_keywords):
+    conflict_kws = ["war", "conflict", "military", "attack", "violence", "troops",
+                    "invasion", "battle", "ceasefire", "coup", "protest", "riot",
+                    "terrorism", "rebel", "armed"]
+    if not any(kw in query_text.lower() for kw in conflict_kws):
         return ""
     try:
-        data = _safe_get(
-            "https://api.acleddata.com/acled/read",
-            params={"key": acled_key, "email": acled_email, "limit": "5",
-                    "fields": "event_date|country|event_type|fatalities",
-                    "order": "event_date:desc"},
-        )
-        if not data or "data" not in data or not data["data"]:
+        data = _safe_get("https://api.acleddata.com/acled/read",
+                         params={"key": acled_key, "email": acled_email, "limit": "5",
+                                 "fields": "event_date|country|event_type|fatalities",
+                                 "order": "event_date:desc"})
+        if not data or not data.get("data"):
             return ""
-        lines = []
-        for ev in data["data"][:5]:
-            lines.append(f"  - {ev.get('event_date','?')}: {ev.get('event_type','?')} in {ev.get('country','?')} ({ev.get('fatalities','?')} fatalities)")
+        lines = [f"  - {ev.get('event_date','?')}: {ev.get('event_type','?')} in {ev.get('country','?')} ({ev.get('fatalities','?')} fatalities)"
+                 for ev in data["data"][:5]]
         return "**Recent Conflict (ACLED):**\n" + "\n".join(lines)
     except Exception as e:
         logger.warning(f"ACLED fetch failed: {e}")
         return ""
 
-
 def fetch_media_trend(query_text: str) -> str:
     import requests
     try:
-        params = {"query": query_text[:60].replace('"',''), "mode": "TimelineVol",
-                  "format": "json", "TIMESPAN": "6m"}
-        resp = requests.get("https://api.gdeltproject.org/api/v2/doc/doc", params=params, timeout=12)
+        resp = requests.get("https://api.gdeltproject.org/api/v2/doc/doc",
+                            params={"query": query_text[:60].replace('"', ''), "mode": "TimelineVol",
+                                    "format": "json", "TIMESPAN": "6m"}, timeout=12)
         if resp.status_code != 200 or "json" not in resp.headers.get("Content-Type", ""):
             return ""
-        data = resp.json()
-        timeline = data.get("timeline", [])
-        if not timeline or not timeline[0].get("data"):
-            return ""
-        series = timeline[0]["data"]
+        series = resp.json().get("timeline", [{}])[0].get("data", [])
         if len(series) < 4:
             return ""
-        recent_avg = sum(d.get("value", 0) for d in series[-6:]) / max(len(series[-6:]), 1)
-        older_avg = sum(d.get("value", 0) for d in series[:6]) / max(len(series[:6]), 1)
-        if older_avg > 0:
-            change = ((recent_avg - older_avg) / older_avg) * 100
+        recent = sum(d.get("value", 0) for d in series[-6:]) / max(len(series[-6:]), 1)
+        older = sum(d.get("value", 0) for d in series[:6]) / max(len(series[:6]), 1)
+        if older > 0:
+            change = (recent - older) / older * 100
             direction = "increasing" if change > 10 else "decreasing" if change < -10 else "stable"
             return f"**Media Attention Trend:** {direction} ({change:+.0f}% over 6 months)"
-        return ""
     except Exception as e:
         logger.warning(f"Media trend fetch failed: {e}")
+    return ""
+
+def fetch_sec_company_info(query_text: str) -> str:
+    fin_kws = ["stock", "revenue", "earnings", "company", "shares", "market cap",
+               "ipo", "nasdaq", "nyse", "profit", "loss", "quarterly", "10-k", "8-k"]
+    if not any(kw in query_text.lower() for kw in fin_kws):
+        return ""
+    try:
+        words = query_text.split()
+        company_query = " ".join(w for w in words[:8] if w and w[0].isupper())[:40] or " ".join(words[:4])
+        data = _safe_get("https://efts.sec.gov/LATEST/search-index",
+                         params={"q": company_query, "forms": "10-K,8-K",
+                                 "dateRange": "custom", "startdt": "2024-01-01"}, timeout=10)
+        if not data:
+            return ""
+        hits = data.get("hits", {}).get("hits", [])
+        if not hits:
+            return ""
+        lines = [f"  - {h.get('_source',{}).get('display_date_filed','?')}: "
+                 f"{h.get('_source',{}).get('entity_name','?')} — "
+                 f"{h.get('_source',{}).get('file_type','?')}" for h in hits[:3]]
+        return ("**SEC Filings (EDGAR):**\n" + "\n".join(lines)) if lines else ""
+    except Exception as e:
+        logger.warning(f"SEC company info fetch failed: {e}")
         return ""
 
+def fetch_sec_filings(query_text: str) -> str:
+    fin_kws = ["stock", "revenue", "earnings", "company", "shares", "market cap",
+               "ipo", "nasdaq", "nyse", "profit", "loss"]
+    if not any(kw in query_text.lower() for kw in fin_kws):
+        return ""
+    try:
+        keywords = " ".join(query_text.split()[:5])
+        data = _safe_get("https://efts.sec.gov/LATEST/search-index",
+                         params={"q": keywords, "forms": "8-K,10-Q",
+                                 "dateRange": "custom", "startdt": "2024-06-01"}, timeout=10)
+        if not data:
+            return ""
+        hits = data.get("hits", {}).get("hits", [])
+        if not hits:
+            return ""
+        lines = [f"  - {h.get('_source',{}).get('display_date_filed','?')}: "
+                 f"{h.get('_source',{}).get('entity_name','?')} "
+                 f"{h.get('_source',{}).get('file_type','?')}" for h in hits[:3]]
+        return ("**Recent SEC Filings:**\n" + "\n".join(lines)) if lines else ""
+    except Exception as e:
+        logger.warning(f"SEC filings fetch failed: {e}")
+        return ""
+
+###############################################################################
+# MULTI-MODEL DEBATE ENGINE
+###############################################################################
+
+async def _call_model(model_id: str, prompt: str, temperature: float = 0.3) -> str:
+    try:
+        llm = GeneralLlm(model=model_id, temperature=temperature, timeout=120, allowed_tries=2)
+        return await llm.invoke(prompt)
+    except Exception as e:
+        logger.warning(f"Model {model_id} failed: {e}")
+        return ""
+
+async def run_debate_ensemble(
+    question_text: str,
+    base_prompt: str,
+    question_context: str = "",
+) -> tuple[float, str]:
+    """
+    Two-round multi-model debate for binary questions.
+
+    Round 1: Each model independently forecasts from the same research brief.
+    Round 2: Each model sees ALL other models' Round 1 reasoning + probabilities,
+             then produces a revised forecast.
+    Final:   Revised probabilities are aggregated via log-odds extremization (alpha=1.2).
+
+    Returns: (final_probability_decimal, combined_reasoning_string)
+    """
+    logger.info("=== DEBATE ENSEMBLE: Round 1 (independent forecasts) ===")
+
+    round1_tasks = {
+        name: _call_model(model_id, base_prompt)
+        for name, model_id in ENSEMBLE_MODELS.items()
+    }
+    results = await asyncio.gather(*round1_tasks.values(), return_exceptions=True)
+    round1_results: Dict[str, str] = {
+        name: (r if isinstance(r, str) else "")
+        for name, r in zip(round1_tasks.keys(), results)
+    }
+
+    round1_probs: Dict[str, Optional[float]] = {}
+    for name, text in round1_results.items():
+        prob = _parse_probability(text)
+        round1_probs[name] = prob
+        logger.info(f"  Round 1 – {name}: {f'{prob*100:.1f}%' if prob else 'PARSE FAIL'}")
+
+    debate_context = "\n\n".join(
+        f"### {name} (Round 1 forecast: {f'{p*100:.1f}%' if p else 'unknown'})\n{text[:1500]}"
+        for (name, text), p in zip(round1_results.items(), round1_probs.values())
+    )
+
+    logger.info("=== DEBATE ENSEMBLE: Round 2 (revisions after seeing peers) ===")
+
+    revision_prompt_template = clean_indents(f"""
+        You are one of four independent forecasters working on this question:
+
+        {question_text}
+
+        {question_context}
+
+        Below are the Round 1 forecasts and reasoning from ALL four forecasters
+        (including your own). Study them carefully. Where you disagree with others,
+        explain why. Where their arguments are compelling, update your view.
+
+        ## All Round 1 Forecasts
+        {debate_context}
+
+        ## Your Task
+        Write a SHORT revised analysis (3-5 paragraphs):
+        1. Which forecasters do you agree with most, and why?
+        2. What is the strongest argument AGAINST your Round 1 position?
+        3. Any evidence or base rate you think others missed?
+        4. Your REVISED probability, accounting for the group reasoning.
+
+        End with: "Revised Probability: ZZ%"
+    """)
+
+    round2_tasks = {
+        name: _call_model(model_id, revision_prompt_template)
+        for name, model_id in ENSEMBLE_MODELS.items()
+    }
+    results = await asyncio.gather(*round2_tasks.values(), return_exceptions=True)
+    round2_results: Dict[str, str] = {
+        name: (r if isinstance(r, str) else "")
+        for name, r in zip(round2_tasks.keys(), results)
+    }
+
+    round2_probs: List[float] = []
+    for name, text in round2_results.items():
+        prob = _parse_probability(text)
+        if prob is not None:
+            round2_probs.append(prob)
+            logger.info(f"  Round 2 – {name}: {prob*100:.1f}%")
+        else:
+            fallback = round1_probs.get(name)
+            if fallback is not None:
+                round2_probs.append(fallback)
+                logger.info(f"  Round 2 – {name}: PARSE FAIL, using Round 1 fallback {fallback*100:.1f}%")
+
+    if not round2_probs:
+        round2_probs = [p for p in round1_probs.values() if p is not None]
+
+    if not round2_probs:
+        logger.error("All model calls failed, returning 0.5")
+        return 0.5, "All model calls failed."
+
+    final_prob = extremize_log_odds(round2_probs, alpha=EXTREMIZATION_ALPHA)
+    logger.info(f"  Ensemble final (alpha={EXTREMIZATION_ALPHA}): {final_prob*100:.1f}%  "
+                f"(from {[f'{p*100:.1f}%' for p in round2_probs]})")
+
+    combined_reasoning = "## Multi-Model Debate Results\n\n"
+    combined_reasoning += "### Round 1 Independent Forecasts\n"
+    for name, prob in round1_probs.items():
+        combined_reasoning += f"- **{name}**: {f'{prob*100:.1f}%' if prob else 'failed'}\n"
+    combined_reasoning += "\n### Round 2 Revised Forecasts (after peer review)\n"
+    for name, text in round2_results.items():
+        prob = _parse_probability(text)
+        combined_reasoning += f"- **{name}**: {f'{prob*100:.1f}%' if prob else 'failed'}\n"
+        combined_reasoning += f"  _{text[:400].strip()}_\n\n"
+    combined_reasoning += (
+        f"\n### Ensemble Result\n"
+        f"Raw revised probabilities: {[f'{p*100:.1f}%' for p in round2_probs]}\n"
+        f"Log-odds extremization (α={EXTREMIZATION_ALPHA}): **{final_prob*100:.1f}%**\n"
+    )
+
+    return final_prob, combined_reasoning
 
 ###############################################################################
 # MAIN BOT CLASS
 ###############################################################################
+
 class DanDanDonkeyBot(ForecastBot):
-    """
-    DanDanDonkeyBot v2 - with inside/outside view research and multi-source data.
-    Free data sources: GDELT, Polymarket, Metaculus community, FRED, World Bank,
-    Wikipedia, WHO GHO, ACLED, GDELT media trends.
-    """
 
     _max_concurrent_questions = 1
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
     _structure_output_validation_samples = 2
-    
-    # Add this line:
-    use_decomposition = True  # Set to False to disable question decomposition
 
-    
     async def run_research(self, question: MetaculusQuestion) -> str:
         async with self._concurrency_limiter:
             q_text = question.question_text
-
-            # Gather all free data sources
             sources = [
                 fetch_metaculus_community(question),
                 fetch_polymarket_data(q_text),
@@ -393,20 +537,17 @@ class DanDanDonkeyBot(ForecastBot):
                 fetch_fred_data(q_text),
                 fetch_world_bank_data(q_text),
                 fetch_who_health_data(q_text),
+                fetch_acled_conflict_data(q_text),
                 fetch_wikipedia_context(q_text),
                 fetch_media_trend(q_text),
                 fetch_sec_company_info(q_text),
                 fetch_sec_filings(q_text),
             ]
-            external_data = "\n\n".join(s for s in sources if s)
-            if not external_data:
-                external_data = "(No external data sources returned results.)"
+            external_data = "\n\n".join(s for s in sources if s) or "(No external data.)"
 
-            # Inside/Outside view structured research prompt
-            research_prompt = clean_indents(
-                f"""
+            research_prompt = clean_indents(f"""
                 You are a research assistant to a superforecaster. Produce a structured
-                research brief covering BOTH the outside view and inside view.
+                research brief covering both outside view and inside view.
 
                 ## Question
                 {question.question_text}
@@ -416,248 +557,197 @@ class DanDanDonkeyBot(ForecastBot):
 
                 {question.fine_print}
 
-                ## External Data Gathered
+                ## External Data
                 {external_data}
 
-                ## Your Task
-                Produce a brief with EXACTLY these sections:
+                ## Important: Community Prediction
+                If Metaculus Community Prediction appears above, treat it as a STRONG PRIOR
+                representing hundreds of calibrated forecasters. Your synthesis must address
+                whether and why you agree or disagree.
 
-                ### OUTSIDE VIEW (Base rates & reference classes)
-                - Historical base rate for events like this
-                - Reference class this question belongs to
-                - Prediction market prices (if data above)
-                - Metaculus community prediction (if data above)
+                ## Output Sections (required)
+
+                ### OUTSIDE VIEW
+                - Base rate / reference class
+                - Prediction market prices
+                - Metaculus community prediction (MUST address)
                 - Analogous past situations
 
-                ### INSIDE VIEW (Specific current evidence)
-                - Recent developments affecting this question
-                - Key causal factors driving the outcome
-                - Relevant data points from sources above
-                - Upcoming events or deadlines that matter
+                ### INSIDE VIEW
+                - Recent specific developments
+                - Key causal factors
+                - Relevant data from above sources
+                - Upcoming deadlines / events
 
                 ### KEY UNCERTAINTIES
-                - 2-3 biggest unknowns that could swing the outcome
-                - Where outside view and inside view disagree
+                - 2-3 biggest unknowns
 
                 ### SYNTHESIS
-                - Brief overall assessment integrating both views
-                - Do NOT give a probability
+                - Overall assessment (no exact probability, just qualitative range)
+                - How much you weight community vs. your own analysis
 
-                Be concise. Cite specific data from the external data above. If there is uncertainty in data, state this and do NOT make up evidence.
-                """
-            )
+                Be concise. Cite data. Do NOT fabricate.
+            """)
 
             researcher = self.get_llm("researcher")
             if isinstance(researcher, GeneralLlm):
                 research = await researcher.invoke(research_prompt)
-            elif isinstance(researcher, str) and (
-                researcher.startswith("asknews/")
-            ):
-                research = await AskNewsSearcher().call_preconfigured_version(
-                    researcher, research_prompt
-                )
+            elif isinstance(researcher, str) and researcher.startswith("asknews/"):
+                research = await AskNewsSearcher().call_preconfigured_version(researcher, research_prompt)
             elif isinstance(researcher, str) and researcher.startswith("smart-searcher"):
-                model_name = researcher.removeprefix("smart-searcher/")
-                searcher = SmartSearcher(
-                    model=model_name, temperature=0,
-                    num_searches_to_run=2, num_sites_per_search=10,
-                    use_advanced_filters=False,
-                )
+                searcher = SmartSearcher(model=researcher.removeprefix("smart-searcher/"),
+                                         temperature=0, num_searches_to_run=2,
+                                         num_sites_per_search=10, use_advanced_filters=False)
                 research = await searcher.invoke(research_prompt)
-            elif not researcher or researcher == "None" or researcher == "no_research":
+            elif not researcher or researcher in ("None", "no_research"):
                 research = external_data
             else:
                 research = await self.get_llm("researcher", "llm").invoke(research_prompt)
 
-            logger.info(f"Research for {question.page_url}:\n{research[:500]}...")
+            logger.info(f"Research done for {question.page_url}")
             return research
 
     async def _run_forecast_on_binary(
         self, question: BinaryQuestion, research: str
     ) -> ReasonedPrediction[float]:
-        prompt = clean_indents(
-            f"""
-            You are a professional forecaster interviewing for a job.
 
-            Your interview question is:
+        base_prompt = clean_indents(f"""
+            You are a professional superforecaster.
+
+            ## Question
             {question.question_text}
 
-            Question background:
+            ## Background
             {question.background_info}
 
-            Resolution criteria (not yet satisfied):
+            ## Resolution Criteria
             {question.resolution_criteria}
 
             {question.fine_print}
 
-            Your research assistant's structured brief:
+            ## Research Brief
             {research}
 
-            Today is {datetime.now().strftime("%Y-%m-%d")}.
+            ## Today's Date
+            {datetime.now().strftime("%Y-%m-%d")}
 
-            Before answering you write:
-            (a) The time left until the outcome is known.
-            (b) The status quo outcome if nothing changed.
-            (c) The OUTSIDE VIEW base rate -- what % of similar situations historically resolved Yes?
-            (d) The INSIDE VIEW adjustment -- what specific current evidence shifts the probability?
-            (e) A brief No scenario.
-            (f) A brief Yes scenario.
-            (g) If prediction market or community forecasts are available, note them and whether you agree.
+            Before giving your probability, write:
+            (a) Time remaining until resolution.
+            (b) Status quo — what happens if nothing changes?
+            (c) OUTSIDE VIEW base rate — what % of similar situations resolved Yes historically?
+            (d) INSIDE VIEW — what specific current evidence shifts the probability?
+            (e) Brief No scenario.
+            (f) Brief Yes scenario.
+            (g) Metaculus community prediction (if in research above) — state it, agree/disagree, WHY.
+                Unless you have strong specific evidence, stay within ~10pp of it.
 
-            Rationale guidelines:
-            - Anchor on the outside view base rate, then adjust with inside view evidence.
-            - Put extra weight on the status quo.
-            - Respect prediction market and community forecasts as informative priors.
             {self._get_conditional_disclaimer_if_necessary(question)}
 
-            The last thing you write is your final answer as: "Probability: ZZ%", 0-100
-            """
-        )
-        if self.use_decomposition and len(question.question_text.split()) > 15:
-            try:
-                decomp = await self._forecast_with_decomposition(
-                    question.question_text, "binary", research
-                )
-                logger.info(f"\n{'='*60}")
-                logger.info(f"DECOMPOSITION FORECAST: {decomp['prediction']:.1f}%")
-                logger.info(f"{'='*60}")
-                logger.info(decomp['reasoning'])
-                logger.info(f"{'='*60}\n")
-            except Exception as e:
-                logger.warning(f"Decomposition failed: {e}")
-        return await self._binary_prompt_to_forecast(question, prompt)
+            End with: "Probability: ZZ%"
+        """)
 
-    async def _binary_prompt_to_forecast(self, question: BinaryQuestion, prompt: str) -> ReasonedPrediction[float]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
-        logger.info(f"Reasoning for {question.page_url}: {reasoning}")
-        binary_prediction: BinaryPrediction = await structure_output(
-            reasoning, BinaryPrediction,
-            model=self.get_llm("parser", "llm"),
-            num_validation_samples=self._structure_output_validation_samples,
+        question_context = clean_indents(f"""
+            Background: {question.background_info[:500]}
+            Resolution: {question.resolution_criteria[:300]}
+        """)
+
+        ensemble_prob, debate_reasoning = await run_debate_ensemble(
+            question_text=question.question_text,
+            base_prompt=base_prompt,
+            question_context=question_context,
         )
-        decimal_pred = max(0.01, min(0.99, binary_prediction.prediction_in_decimal))
-        logger.info(f"Forecasted {question.page_url}: {decimal_pred}")
-        return ReasonedPrediction(prediction_value=decimal_pred, reasoning=reasoning)
+
+        community_pred = _extract_community_float(question)
+        final_prob = community_anchored_blend(ensemble_prob, community_pred)
+
+        full_reasoning = (
+            debate_reasoning
+            + f"\n\n### Community Blend\n"
+            + f"Ensemble: {ensemble_prob*100:.1f}%  |  "
+            + f"Community: {f'{community_pred*100:.1f}%' if community_pred else 'N/A'}  |  "
+            + f"Final (weight={COMMUNITY_WEIGHT}): **{final_prob*100:.1f}%**"
+        )
+
+        logger.info(f"Final prediction for {question.page_url}: {final_prob:.3f}")
+        return ReasonedPrediction(prediction_value=final_prob, reasoning=full_reasoning)
 
     async def _run_forecast_on_multiple_choice(
         self, question: MultipleChoiceQuestion, research: str
     ) -> ReasonedPrediction[PredictedOptionList]:
-        prompt = clean_indents(
-            f"""
-            You are a professional forecaster interviewing for a job.
+        prompt = clean_indents(f"""
+            You are a professional forecaster.
 
-            Your interview question is:
-            {question.question_text}
-
-            The options are: {question.options}
-
-            Background:
-            {question.background_info}
-
+            Question: {question.question_text}
+            Options: {question.options}
+            Background: {question.background_info}
             {question.resolution_criteria}
             {question.fine_print}
+            Research: {research}
+            Today: {datetime.now().strftime("%Y-%m-%d")}
 
-            Your research assistant's structured brief:
-            {research}
-
-            Today is {datetime.now().strftime("%Y-%m-%d")}.
-
-            Before answering you write:
-            (a) Time left until outcome is known.
-            (b) Status quo outcome if nothing changed.
-            (c) OUTSIDE VIEW -- base rates, prediction markets, community forecasts.
-            (d) INSIDE VIEW -- specific current evidence favoring certain options.
-            (e) An unexpected outcome scenario.
+            (a) Time left. (b) Status quo. (c) OUTSIDE VIEW (community/markets — address these).
+            (d) INSIDE VIEW. (e) Unexpected outcome scenario.
 
             {self._get_conditional_disclaimer_if_necessary(question)}
-            Remember: (1) anchor on base rates, (2) weight status quo, (3) leave moderate probability on most options.
 
-            Final probabilities for options {question.options} as:
+            Final probabilities:
             Option_A: Probability_A
             Option_B: Probability_B
             ...
-            Option_N: Probability_N
-            """
-        )
+        """)
         return await self._multiple_choice_prompt_to_forecast(question, prompt)
 
-    async def _multiple_choice_prompt_to_forecast(self, question: MultipleChoiceQuestion, prompt: str) -> ReasonedPrediction[PredictedOptionList]:
-        parsing_instructions = clean_indents(
-            f"""
-            Make sure all option names are one of: {question.options}
-            Remove any "Option" prefix not part of the actual option names.
-            Do not skip 0% options -- include them with 0% probability.
-            """
-        )
+    async def _multiple_choice_prompt_to_forecast(self, question, prompt):
+        parsing_instructions = clean_indents(f"""
+            Option names must be one of: {question.options}
+            Remove any "Option" prefix. Include 0% options.
+        """)
         reasoning = await self.get_llm("default", "llm").invoke(prompt)
-        logger.info(f"Reasoning for {question.page_url}: {reasoning}")
         predicted_option_list: PredictedOptionList = await structure_output(
             text_to_structure=reasoning, output_type=PredictedOptionList,
             model=self.get_llm("parser", "llm"),
             num_validation_samples=self._structure_output_validation_samples,
             additional_instructions=parsing_instructions,
         )
-        logger.info(f"Forecasted {question.page_url}: {predicted_option_list}")
         return ReasonedPrediction(prediction_value=predicted_option_list, reasoning=reasoning)
 
     async def _run_forecast_on_numeric(self, question: NumericQuestion, research: str) -> ReasonedPrediction[NumericDistribution]:
         upper_msg, lower_msg = self._create_upper_and_lower_bound_messages(question)
-        prompt = clean_indents(
-            f"""
-            You are a professional forecaster interviewing for a job.
+        prompt = clean_indents(f"""
+            You are a professional forecaster.
 
-            Your interview question is:
-            {question.question_text}
-
+            Question: {question.question_text}
             Background: {question.background_info}
             {question.resolution_criteria}
             {question.fine_print}
-            Units: {question.unit_of_measure if question.unit_of_measure else "Not stated (infer)"}
-
-            Research brief:
-            {research}
-
-            Today is {datetime.now().strftime("%Y-%m-%d")}.
+            Units: {question.unit_of_measure or "infer from context"}
+            Research: {research}
+            Today: {datetime.now().strftime("%Y-%m-%d")}
             {lower_msg}
             {upper_msg}
 
-            Formatting: Use correct units. No scientific notation. Percentile 10 < 20 < 40 < 60 < 80 < 90.
-
-            Before answering:
-            (a) Time left.
-            (b) OUTSIDE VIEW -- historical base rates.
-            (c) INSIDE VIEW -- current specific evidence.
-            (d) Expert/market expectations.
-            (e) Low outcome scenario.
-            (f) High outcome scenario.
+            (a) Time left. (b) OUTSIDE VIEW (base rates, community). (c) INSIDE VIEW.
+            (d) Expert/market expectations. (e) Low scenario. (f) High scenario.
 
             {self._get_conditional_disclaimer_if_necessary(question)}
-            Set wide 90/10 confidence intervals for unknown unknowns.
+            Use wide 10/90 intervals. No scientific notation.
 
-            Final answer:
-            "
             Percentile 10: XX
             Percentile 20: XX
             Percentile 40: XX
             Percentile 60: XX
             Percentile 80: XX
             Percentile 90: XX
-            "
-            """
-        )
+        """)
         return await self._numeric_prompt_to_forecast(question, prompt)
 
-    async def _numeric_prompt_to_forecast(self, question: NumericQuestion, prompt: str) -> ReasonedPrediction[NumericDistribution]:
+    async def _numeric_prompt_to_forecast(self, question, prompt):
         reasoning = await self.get_llm("default", "llm").invoke(prompt)
-        logger.info(f"Reasoning for {question.page_url}: {reasoning}")
-        parsing_instructions = clean_indents(
-            f"""
-            Parsing a numeric forecast for: "{question.question_text}".
-            Units: {question.unit_of_measure}. Example range: {question.lower_bound} to {question.upper_bound}.
-            Parse values in correct units. Convert scientific notation to regular numbers.
-            If percentiles not explicitly given, indicate that.
-            """
-        )
+        parsing_instructions = clean_indents(f"""
+            Numeric forecast for: "{question.question_text}".
+            Units: {question.unit_of_measure}. Range: {question.lower_bound} to {question.upper_bound}.
+            No scientific notation.
+        """)
         percentile_list: list[Percentile] = await structure_output(
             reasoning, list[Percentile],
             model=self.get_llm("parser", "llm"),
@@ -665,60 +755,43 @@ class DanDanDonkeyBot(ForecastBot):
             num_validation_samples=self._structure_output_validation_samples,
         )
         prediction = NumericDistribution.from_question(percentile_list, question)
-        logger.info(f"Forecasted {question.page_url}: {prediction.declared_percentiles}")
         return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
 
     async def _run_forecast_on_date(self, question: DateQuestion, research: str) -> ReasonedPrediction[NumericDistribution]:
         upper_msg, lower_msg = self._create_upper_and_lower_bound_messages(question)
-        prompt = clean_indents(
-            f"""
-            You are a professional forecaster interviewing for a job.
+        prompt = clean_indents(f"""
+            You are a professional forecaster.
 
             Question: {question.question_text}
             Background: {question.background_info}
             {question.resolution_criteria}
             {question.fine_print}
-
-            Research brief:
-            {research}
-
-            Today is {datetime.now().strftime("%Y-%m-%d")}.
+            Research: {research}
+            Today: {datetime.now().strftime("%Y-%m-%d")}
             {lower_msg}
             {upper_msg}
 
-            Format: YYYY-MM-DD. Chronological order (earliest first).
+            Format dates YYYY-MM-DD, earliest first. Wide confidence intervals.
 
-            Before answering:
             (a) Time left. (b) OUTSIDE VIEW. (c) INSIDE VIEW.
             (d) Expert expectations. (e) Early scenario. (f) Late scenario.
 
-            {self._get_conditional_disclaimer_if_necessary(question)}
-            Set wide confidence intervals.
-
-            Final answer:
-            "
             Percentile 10: YYYY-MM-DD
             Percentile 20: YYYY-MM-DD
             Percentile 40: YYYY-MM-DD
             Percentile 60: YYYY-MM-DD
             Percentile 80: YYYY-MM-DD
             Percentile 90: YYYY-MM-DD
-            "
-            """
-        )
+        """)
         return await self._date_prompt_to_forecast(question, prompt)
 
-    async def _date_prompt_to_forecast(self, question: DateQuestion, prompt: str) -> ReasonedPrediction[NumericDistribution]:
+    async def _date_prompt_to_forecast(self, question, prompt):
         reasoning = await self.get_llm("default", "llm").invoke(prompt)
-        logger.info(f"Reasoning for {question.page_url}: {reasoning}")
-        parsing_instructions = clean_indents(
-            f"""
-            Parsing a date forecast for: "{question.question_text}".
+        parsing_instructions = clean_indents(f"""
+            Date forecast for: "{question.question_text}".
             Range: {question.lower_bound} to {question.upper_bound}.
-            Format dates as valid datetime strings. Assume midnight UTC if no hour given.
-            If percentiles not explicitly given, indicate that.
-            """
-        )
+            Valid datetime strings, midnight UTC if no time given.
+        """)
         date_percentile_list: list[DatePercentile] = await structure_output(
             reasoning, list[DatePercentile],
             model=self.get_llm("parser", "llm"),
@@ -730,10 +803,9 @@ class DanDanDonkeyBot(ForecastBot):
             for p in date_percentile_list
         ]
         prediction = NumericDistribution.from_question(percentile_list, question)
-        logger.info(f"Forecasted {question.page_url}: {prediction.declared_percentiles}")
         return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
 
-    def _create_upper_and_lower_bound_messages(self, question: NumericQuestion | DateQuestion) -> tuple[str, str]:
+    def _create_upper_and_lower_bound_messages(self, question):
         if isinstance(question, NumericQuestion):
             upper = question.nominal_upper_bound if question.nominal_upper_bound is not None else question.upper_bound
             lower = question.nominal_lower_bound if question.nominal_lower_bound is not None else question.lower_bound
@@ -744,26 +816,22 @@ class DanDanDonkeyBot(ForecastBot):
             unit = ""
         else:
             raise ValueError()
-        upper_msg = (f"The question creator thinks the number is likely not higher than {upper} {unit}."
-                     if question.open_upper_bound else f"The outcome can not be higher than {upper} {unit}.")
-        lower_msg = (f"The question creator thinks the number is likely not lower than {lower} {unit}."
-                     if question.open_lower_bound else f"The outcome can not be lower than {lower} {unit}.")
+        upper_msg = (f"Creator thinks likely not higher than {upper} {unit}."
+                     if question.open_upper_bound else f"Cannot be higher than {upper} {unit}.")
+        lower_msg = (f"Creator thinks likely not lower than {lower} {unit}."
+                     if question.open_lower_bound else f"Cannot be lower than {lower} {unit}.")
         return upper_msg, lower_msg
 
-    async def _run_forecast_on_conditional(self, question: ConditionalQuestion, research: str) -> ReasonedPrediction[ConditionalPrediction]:
+    async def _run_forecast_on_conditional(self, question: ConditionalQuestion, research: str):
         parent_info, full_research = await self._get_question_prediction_info(question.parent, research, "parent")
-        child_info, full_research = await self._get_question_prediction_info(question.child, research, "child")
+        child_info, full_research = await self._get_question_prediction_info(question.child, full_research, "child")
         yes_info, full_research = await self._get_question_prediction_info(question.question_yes, full_research, "yes")
         no_info, full_research = await self._get_question_prediction_info(question.question_no, full_research, "no")
         full_reasoning = clean_indents(f"""
-            ## Parent Question Reasoning
-            {parent_info.reasoning}
-            ## Child Question Reasoning
-            {child_info.reasoning}
-            ## Yes Question Reasoning
-            {yes_info.reasoning}
-            ## No Question Reasoning
-            {no_info.reasoning}
+            ## Parent: {parent_info.reasoning}
+            ## Child: {child_info.reasoning}
+            ## Yes: {yes_info.reasoning}
+            ## No: {no_info.reasoning}
         """)
         return ReasonedPrediction(
             reasoning=full_reasoning,
@@ -781,8 +849,8 @@ class DanDanDonkeyBot(ForecastBot):
             pf = previous_forecasts[-1]
             if pf.timestamp_end is None or pf.timestamp_end > datetime.now(timezone.utc):
                 pretty = DataOrganizer.get_readable_prediction(pf)
-                return (ReasonedPrediction(prediction_value=PredictionAffirmed(),
-                        reasoning=f"Reaffirmed at {pretty}."), research)
+                return ReasonedPrediction(prediction_value=PredictionAffirmed(),
+                                          reasoning=f"Reaffirmed at {pretty}."), research
         info = await self._make_prediction(question, research)
         full_research = self._add_reasoning_to_research(research, info, question_type)
         return info, full_research
@@ -802,156 +870,249 @@ class DanDanDonkeyBot(ForecastBot):
     def _get_conditional_disclaimer_if_necessary(self, question):
         if question.conditional_type not in ["yes", "no"]:
             return ""
-        return clean_indents("""
-            You are forecasting the CHILD question given the parent's resolution.
-            Never re-forecast the parent question.
-        """)
-    
-    async def _generate_debiased_ensemble(self, question_text: str, base_prompt: str, num_forecasts: int = 5) -> tuple[float, dict]:
-        """
-        Generate multiple forecasts and apply debiasing to get final prediction.
-        Returns: (final_prediction, bias_analysis)
-        """
-        logger.info(f"Generating {num_forecasts} forecasts with debiasing for: {question_text[:100]}")
-        
-        # Generate multiple independent forecasts
-        raw_forecasts = []
-        for i in range(num_forecasts):
-            try:
-                # Add some randomness to temperature for diversity
-                temp_llm = self.get_llm("default", "llm")
-                response = await temp_llm.invoke(base_prompt + f"\n\n(This is forecast {i+1} of {num_forecasts})")
-                
-                # Extract probability from response (you'll need to parse based on your prompt format)
-                import re
-                match = re.search(r'(\d+\.?\d*)\s*%', response)
-                if match:
-                    prob = float(match.group(1))
-                    raw_forecasts.append({
-                        'prediction': prob,
-                        'reasoning': response[:2000]  # Truncate for efficiency
-                    })
-                else:
-                    logger.warning(f"Could not parse forecast {i+1}, skipping")
-            except Exception as e:
-                logger.error(f"Error generating forecast {i+1}: {e}")
-        
-        if not raw_forecasts:
-            logger.error("No valid forecasts generated, returning 50%")
-            return 50.0, {}
-        
-        # Apply debiasing layer
-        try:
-            from debiasing_layer import debias_all_forecasters, analyze_bias_patterns, format_debiasing_summary
-            
-            debiased_forecasts = await debias_all_forecasters(
-                raw_forecasts,
-                question_text,
-                self.get_llm("default", "llm")
-            )
-            
-            # Aggregate debiased predictions
-            adjusted_predictions = [f['adjusted_prediction'] for f in debiased_forecasts]
-            final_prediction = sum(adjusted_predictions) / len(adjusted_predictions)
-            
-            # Analyze bias patterns for logging
-            bias_analysis = analyze_bias_patterns(debiased_forecasts)
-            logger.info(f"\n{format_debiasing_summary(bias_analysis)}")
-            
-            return final_prediction, bias_analysis
-            
-        except Exception as e:
-            logger.error(f"Debiasing failed: {e}, falling back to simple average")
-            raw_predictions = [f['prediction'] for f in raw_forecasts]
-            return sum(raw_predictions) / len(raw_predictions), {}
+        return "You are forecasting the CHILD question given the parent resolved. Never re-forecast the parent."
 
-    async def _forecast_with_decomposition(
-        self, 
-        question_text: str,
-        question_type: str,
-        research: str
-    ) -> Dict:
-        """Use question decomposition for complex questions."""
-        try:
-            decomp_result = await decompose_and_forecast(
-                question_text=question_text,
-                question_type=question_type,
-                research_context=research,
-                llm_client=self.get_llm("default", "llm"),
-                max_subquestions=5
-            )
-            
-            logger.info(f"\n{format_decomposition_summary(decomp_result)}")
-            
-            prediction = decomp_result['final_forecast']
-            
-            reasoning = "=== Question Decomposition Analysis ===\n\n"
-            reasoning += f"Method: {decomp_result['combination_method']}\n\n"
-            reasoning += "Sub-question forecasts:\n"
-            
-            for i, sf in enumerate(decomp_result['subforecasts'], 1):
-                reasoning += f"\n{i}. {sf['subquestion']}\n"
-                reasoning += f"   Estimate: {sf['estimate']:.1f}%\n"
-                reasoning += f"   Confidence: {sf['confidence']}\n"
-            
-            reasoning += f"\n\nCombined forecast: {prediction:.1f}%\n"
-            
-            return {
-                'prediction': prediction,
-                'reasoning': reasoning,
-                'decomposition_details': decomp_result
-            }
-            
-        except Exception as e:
-            logger.error(f"Decomposition failed: {e}")
-            return {
-                'prediction': 50.0,
-                'reasoning': f"Decomposition failed: {str(e)}",
-                'decomposition_details': None
-            }
+def save_summary_report(forecast_reports: list, output_path: str = "reports/summary.md") -> None:
+    import os
 
-            
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    rows = []
+    for report in forecast_reports:
+        if isinstance(report, Exception):
+            continue
+        try:
+            question = report.question
+            question_text = question.question_text[:80] + ("..." if len(question.question_text) > 80 else "")
+            url = getattr(question, "page_url", "")
+
+            community_raw = _extract_community_float(question)
+            community_str = f"{community_raw*100:.1f}%" if community_raw is not None else "N/A"
+
+            final_pred = None
+            reasoning = ""
+            for forecast_report in getattr(report, "prediction_reports", []):
+                pred = getattr(forecast_report, "prediction", None)
+                if isinstance(pred, float):
+                    final_pred = pred
+                reasoning = getattr(forecast_report, "reasoning", "") or ""
+
+            if final_pred is None:
+                continue
+
+            final_str = f"{final_pred*100:.1f}%"
+
+            delta_str = "N/A"
+            if community_raw is not None:
+                delta = (final_pred - community_raw) * 100
+                delta_str = f"{delta:+.1f}pp"
+
+            r1_probs = []
+            r2_probs = []
+            for line in reasoning.splitlines():
+                if "Round 1" in line and "%" in line:
+                    import re
+                    matches = re.findall(r'(\d+\.?\d*)%', line)
+                    r1_probs += [float(m) for m in matches]
+                if "Round 2" in line and "%" in line:
+                    import re
+                    matches = re.findall(r'(\d+\.?\d*)%', line)
+                    r2_probs += [float(m) for m in matches]
+
+            r1_str = f"{sum(r1_probs)/len(r1_probs):.1f}%" if r1_probs else "N/A"
+            r2_str = f"{sum(r2_probs)/len(r2_probs):.1f}%" if r2_probs else "N/A"
+
+            rows.append({
+                "question": question_text,
+                "url": url,
+                "community": community_str,
+                "r1_avg": r1_str,
+                "r2_avg": r2_str,
+                "final": final_str,
+                "delta": delta_str,
+            })
+        except Exception as e:
+            logger.warning(f"Could not parse report for summary: {e}")
+            continue
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    lines = [
+        f"# DanDanDonkeyBot Forecast Summary",
+        f"*Generated: {now}*",
+        f"*Questions forecasted: {len(rows)}*",
+        "",
+        "| # | Question | Community | R1 Avg | R2 Avg | Final | Δ Community |",
+        "|---|----------|-----------|--------|--------|-------|-------------|",
+    ]
+    for i, r in enumerate(rows, 1):
+        q_link = f"[{r['question']}]({r['url']})" if r['url'] else r['question']
+        lines.append(
+            f"| {i} | {q_link} | {r['community']} | {r['r1_avg']} | {r['r2_avg']} | {r['final']} | {r['delta']} |"
+        )
+
+    lines += [
+        "",
+        "## Divergence from Community (>5pp)",
+        "",
+    ]
+    diverged = [r for r in rows if r['delta'] not in ("N/A",) and abs(float(r['delta'].replace("pp","").replace("+",""))) > 5]
+    if diverged:
+        for r in diverged:
+            lines.append(f"- **{r['delta']}** — {r['question']}")
+    else:
+        lines.append("- None — ensemble stayed within 5pp of community on all questions.")
+
+    with open(output_path, "w") as f:
+        f.write("\n".join(lines))
+
+    print(f"Summary saved to {output_path}")
+    logger.info(f"Summary report saved to {output_path}")
+
+def save_summary_report(forecast_reports: list, output_path: str = "reports/summary.md") -> None:
+    import os
+    import re as _re
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    rows = []
+    for report in forecast_reports:
+        if isinstance(report, Exception):
+            continue
+        try:
+            question = report.question
+            q_text = question.question_text
+            q_short = q_text[:80] + ("..." if len(q_text) > 80 else "")
+            url = getattr(question, "page_url", "")
+            community_raw = _extract_community_float(question)
+            community_str = f"{community_raw*100:.1f}%" if community_raw is not None else "N/A"
+
+            final_pred = None
+            reasoning = ""
+            for pred_report in getattr(report, "prediction_reports", []):
+                pred = getattr(pred_report, "prediction", None)
+                if isinstance(pred, float):
+                    final_pred = pred
+                reasoning = getattr(pred_report, "reasoning", "") or ""
+
+            if final_pred is None:
+                continue
+
+            final_str = f"{final_pred*100:.1f}%"
+            delta_str = "N/A"
+            if community_raw is not None:
+                delta = (final_pred - community_raw) * 100
+                delta_str = f"{delta:+.1f}pp"
+
+            r1_probs, r2_probs = [], []
+            for line in reasoning.split("\n"):
+                if "Round 1" in line and "%" in line:
+                    r1_probs += [float(m) for m in _re.findall(r'(\d+\.?\d*)%', line)]
+                if "Round 2" in line and "%" in line:
+                    r2_probs += [float(m) for m in _re.findall(r'(\d+\.?\d*)%', line)]
+
+            r1_str = f"{sum(r1_probs)/len(r1_probs):.1f}%" if r1_probs else "N/A"
+            r2_str = f"{sum(r2_probs)/len(r2_probs):.1f}%" if r2_probs else "N/A"
+
+            rows.append({
+                "question": q_short, "url": url,
+                "community": community_str, "r1_avg": r1_str,
+                "r2_avg": r2_str, "final": final_str, "delta": delta_str,
+            })
+        except Exception as e:
+            logger.warning(f"Could not parse report for summary: {e}")
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    md = [
+        "# DanDanDonkeyBot Forecast Summary",
+        f"*Generated: {now} | Questions: {len(rows)}*",
+        "",
+        "| # | Question | Community | R1 Avg | R2 Avg | Final | Δ Community |",
+        "|---|----------|-----------|--------|--------|-------|-------------|",
+    ]
+    for i, r in enumerate(rows, 1):
+        q_cell = f"[{r['question']}]({r['url']})" if r['url'] else r['question']
+        md.append(f"| {i} | {q_cell} | {r['community']} | {r['r1_avg']} | {r['r2_avg']} | {r['final']} | {r['delta']} |")
+
+    md += ["", "## Diverged from Community (>5pp)", ""]
+    diverged = [
+        r for r in rows
+        if r['delta'] != "N/A" and abs(float(r['delta'].replace("pp", "").replace("+", ""))) > 5
+    ]
+    if diverged:
+        for r in diverged:
+            md.append(f"- **{r['delta']}** — {r['question']}")
+    else:
+        md.append("- None")
+
+    with open(output_path, "w") as f:
+        f.write("\n".join(md))
+    logger.info(f"Summary report saved to {output_path}")
+
+
+###############################################################################
+# ENTRYPOINT
+###############################################################################
+
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
     logging.getLogger("LiteLLM").setLevel(logging.WARNING)
     logging.getLogger("LiteLLM").propagate = False
 
-    parser = argparse.ArgumentParser(description="Run DanDanDonkeyBot v2")
-    parser.add_argument("--mode", type=str, choices=["tournament", "metaculus_cup", "test_questions"], default="tournament")
+    parser = argparse.ArgumentParser(description="Run DanDanDonkeyBot v4")
+    parser.add_argument("--mode", type=str,
+                        choices=["tournament", "metaculus_cup", "test_questions"],
+                        default="tournament")
     args = parser.parse_args()
     run_mode: Literal["tournament", "metaculus_cup", "test_questions"] = args.mode
 
     danbot = DanDanDonkeyBot(
         research_reports_per_question=1,
-        predictions_per_research_report=5,
+        predictions_per_research_report=1,
         use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=False,
         folder_to_save_reports_to="reports",
         skip_previously_forecasted_questions=True,
         extra_metadata_in_explanation=True,
         llms={
-            "default": GeneralLlm(model="openrouter/deepseek/deepseek-r1", temperature=0.3, timeout=300, allowed_tries=2),
+            "researcher": GeneralLlm(
+                model="anthropic/claude-sonnet-4-6",
+                temperature=0.2, timeout=300, allowed_tries=2
+            ),
+            "default": GeneralLlm(
+                model="openrouter/deepseek/deepseek-r1",
+                temperature=0.3, timeout=300, allowed_tries=2
+            ),
             "summarizer": "openrouter/deepseek/deepseek-chat",
-            "researcher": GeneralLlm(model="openrouter/deepseek/deepseek-r1", temperature=0.3, timeout=300, allowed_tries=2),
-            "parser": "openrouter/deepseek/deepseek-chat",
+            "parser":     "openrouter/deepseek/deepseek-chat",
         },
     )
 
     client = MetaculusClient()
+
     if run_mode == "tournament":
-        reports1 = asyncio.run(danbot.forecast_on_tournament(client.CURRENT_AI_COMPETITION_ID, return_exceptions=True))
-        reports2 = asyncio.run(danbot.forecast_on_tournament(client.CURRENT_MINIBENCH_ID, return_exceptions=True))
+        reports1 = asyncio.run(danbot.forecast_on_tournament(
+            client.CURRENT_AI_COMPETITION_ID, return_exceptions=True))
+        reports2 = asyncio.run(danbot.forecast_on_tournament(
+            client.CURRENT_MINIBENCH_ID, return_exceptions=True))
         forecast_reports = reports1 + reports2
+
     elif run_mode == "metaculus_cup":
         danbot.skip_previously_forecasted_questions = False
-        forecast_reports = asyncio.run(danbot.forecast_on_tournament(client.CURRENT_METACULUS_CUP_ID, return_exceptions=True))
+        forecast_reports = asyncio.run(danbot.forecast_on_tournament(
+            client.CURRENT_METACULUS_CUP_ID, return_exceptions=True))
+
     elif run_mode == "test_questions":
         EXAMPLE_QUESTIONS = [
-    "https://www.metaculus.com/questions/578/human-extinction-by-2100/",
-    "https://www.metaculus.com/questions/22427/number-of-new-leading-ai-labs/",
-    "https://www.metaculus.com/questions/25523/nigel-farage-uk-pm-before-jan-1-2035/",
-]
+            "https://www.metaculus.com/questions/578/human-extinction-by-2100/",
+            "https://www.metaculus.com/questions/22427/number-of-new-leading-ai-labs/",
+            "https://www.metaculus.com/questions/25523/nigel-farage-uk-pm-before-jan-1-2035/",
+        ]
         danbot.skip_previously_forecasted_questions = False
         questions = [client.get_question_by_url(url) for url in EXAMPLE_QUESTIONS]
         forecast_reports = asyncio.run(danbot.forecast_questions(questions, return_exceptions=True))
+
     danbot.log_report_summary(forecast_reports)
+    save_summary_report(forecast_reports)
