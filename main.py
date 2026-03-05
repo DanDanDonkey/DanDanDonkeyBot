@@ -37,7 +37,6 @@ from forecasting_tools import (
 dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
 
-# Two OpenRouter keys: Metaculus-provided (free credits) and personal
 METACULUS_OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY")
 
 ###############################################################################
@@ -46,39 +45,39 @@ METACULUS_OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY")
 
 # 5-model ensemble: diverse providers, diverse training paradigms
 # All routed via OpenRouter (Metaculus free credits)
-# o3 chosen over o4-mini: empirically lower Brier score (0.1352 vs 0.1589) per Lu 2025
 ENSEMBLE_MODELS = {
-    "DeepSeek-R1":   "openrouter/deepseek/deepseek-r1",           # Strong reasoning, open-weight
-    "GPT-o3":        "openrouter/openai/o3",                      # Best OpenAI Brier score (0.1352)
-    "Grok-4":        "openrouter/x-ai/grok-4",                    # xAI, real-time search aware
-    "Claude-Sonnet": "openrouter/anthropic/claude-sonnet-4-6",    # Anthropic
-    "Llama-405B":    "openrouter/meta-llama/llama-3.1-405b-instruct",  # Open-weight frontier
+    "DeepSeek-R1":   "openrouter/deepseek/deepseek-r1",
+    "GPT-o3":        "openrouter/openai/o3",
+    "Grok-4":        "openrouter/x-ai/grok-4",
+    "Claude-Sonnet": "openrouter/anthropic/claude-sonnet-4-6",
+    "Llama-405B":    "openrouter/meta-llama/llama-3.1-405b-instruct",
 }
 
-EXTREMIZATION_ALPHA = 1.2   # From Calibeating paper: log-odds extremization factor
-COMMUNITY_WEIGHT_DEFAULT = 0.40   # Standard questions
-COMMUNITY_WEIGHT_ECON    = 0.55   # Economics/finance: LLMs are empirically worse here (Lu 2025)
+# Calibeating extremization (Foster & Hart 2022):
+# LLMs systematically hedge toward 50%. Convert probabilities to log-odds,
+# average, multiply by alpha>1 to push away from 50%, convert back.
+# This corrects calibration error (K) without destroying refinement (R).
+# Brier score B = R + K, so fixing K directly lowers B.
+EXTREMIZATION_ALPHA = 1.2
 
-# Conditional debate threshold (v8).
-# Phase 2 only runs when Phase 1 spread exceeds this value.
-# Rationale: when 5 models already agree (low spread), Phase 2 adds noise more than
-# signal. High spread = genuine disagreement = something worth resolving.
-# Tune down to 0.15 if you want more Phase 2 coverage after postmortem analysis.
-DEBATE_SPREAD_THRESHOLD = 0.20   # 20 percentage points
+COMMUNITY_WEIGHT_DEFAULT = 0.40
+COMMUNITY_WEIGHT_ECON    = 0.55
 
-# Token caps — prevents o3 reasoning chains from blowing up output costs.
-# o3 output costs $8/M tokens; an uncapped reasoning response can hit 6-8k tokens.
-MAX_TOKENS_PHASE1    = 1200   # Outside view + inside view + range + probability
-MAX_TOKENS_PHASE2    = 1000   # Debate response + revised probability
-MAX_TOKENS_RESEARCH  = 1500   # Research synthesis brief
-MAX_TOKENS_FORECAST  = 1500   # Final numeric/MC/date forecast
+# v9: Lowered from 0.20 to 0.15 — at 0.20, correlated LLM outputs
+# rarely triggered Phase 2. 0.15 catches more genuine disagreements.
+DEBATE_SPREAD_THRESHOLD = 0.15
 
-# External data per-source character caps — keeps input tokens predictable
-_SRC_CAP_ASKNEWS   = 2500   # Primary news source — allow more
-_SRC_CAP_DEFAULT   = 600    # All other sources
-_EXTERNAL_DATA_CAP = 6000   # Hard cap on total external_data fed to research prompt
+# Token caps — prevents o3 reasoning chains from blowing up costs
+MAX_TOKENS_PHASE1    = 1200
+MAX_TOKENS_PHASE2    = 1000
+MAX_TOKENS_RESEARCH  = 1500
+MAX_TOKENS_FORECAST  = 1500
 
-# Keywords that trigger higher community weight
+# External data per-source character caps
+_SRC_CAP_ASKNEWS   = 2500
+_SRC_CAP_DEFAULT   = 600
+_EXTERNAL_DATA_CAP = 6000
+
 ECON_KEYWORDS = [
     "gdp", "inflation", "unemployment", "interest rate", "fed ", "federal reserve",
     "stock", "market cap", "earnings", "revenue", "recession", "economic", "economy",
@@ -87,19 +86,147 @@ ECON_KEYWORDS = [
 ]
 
 def _get_community_weight(question_text: str) -> float:
-    """Return higher community weight for economics questions where LLMs underperform."""
     q_lower = question_text.lower()
     if any(kw in q_lower for kw in ECON_KEYWORDS):
         logger.info("  Economics question detected → community_weight=0.55")
         return COMMUNITY_WEIGHT_ECON
     return COMMUNITY_WEIGHT_DEFAULT
 
+
+###############################################################################
+# POSTMORTEM / BRIER SCORE TRACKING (v9 — NEW)
+###############################################################################
+
+_POSTMORTEM_PATH = "reports/postmortem.jsonl"
+
+
+def _log_prediction(question_url: str, question_text: str, prediction: float,
+                    community_pred: Optional[float], ensemble_pred: float,
+                    phase2_ran: bool, question_type: str = "binary",
+                    metadata: dict = None) -> None:
+    """
+    Append a prediction record to postmortem JSONL.
+    Each line is self-contained JSON for incremental analysis.
+    After questions resolve, a separate script fills in resolution + brier_score.
+    """
+    os.makedirs(os.path.dirname(_POSTMORTEM_PATH), exist_ok=True)
+    record = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "question_url": question_url,
+        "question_text": question_text[:200],
+        "question_type": question_type,
+        "prediction": round(prediction, 4),
+        "community_pred": round(community_pred, 4) if community_pred else None,
+        "ensemble_pred": round(ensemble_pred, 4),
+        "phase2_ran": phase2_ran,
+        "alpha": EXTREMIZATION_ALPHA,
+        "community_weight": _get_community_weight(question_text),
+        "debate_threshold": DEBATE_SPREAD_THRESHOLD,
+        "resolution": None,
+        "brier_score": None,
+        **(metadata or {}),
+    }
+    try:
+        with open(_POSTMORTEM_PATH, "a") as f:
+            f.write(json.dumps(record) + "\n")
+        logger.info(f"  Postmortem logged: {question_url}")
+    except Exception as e:
+        logger.warning(f"Failed to log postmortem: {e}")
+
+
+def compute_postmortem_stats(postmortem_path: str = _POSTMORTEM_PATH) -> dict:
+    """
+    Compute calibration/accuracy stats from resolved predictions.
+    Run after updating resolution values in the JSONL file.
+    Returns Brier scores, calibration bins, and parameter tuning recommendations.
+    """
+    if not os.path.exists(postmortem_path):
+        return {"error": "No postmortem file found"}
+
+    records = []
+    with open(postmortem_path) as f:
+        for line in f:
+            try:
+                r = json.loads(line.strip())
+                if r.get("resolution") is not None and r.get("prediction") is not None:
+                    records.append(r)
+            except json.JSONDecodeError:
+                continue
+
+    if not records:
+        return {"error": "No resolved predictions found"}
+
+    # Overall Brier
+    brier_scores = [(r["prediction"] - r["resolution"]) ** 2 for r in records]
+    avg_brier = sum(brier_scores) / len(brier_scores)
+
+    # Brier by question type
+    by_type = {}
+    for r in records:
+        qt = r.get("question_type", "binary")
+        by_type.setdefault(qt, []).append((r["prediction"] - r["resolution"]) ** 2)
+    brier_by_type = {k: sum(v) / len(v) for k, v in by_type.items()}
+
+    # Community comparison
+    community_brier = [
+        (r["community_pred"] - r["resolution"]) ** 2
+        for r in records if r.get("community_pred") is not None
+    ]
+    avg_community_brier = sum(community_brier) / len(community_brier) if community_brier else None
+
+    # Phase 2 impact
+    p2_yes = [bs for r, bs in zip(records, brier_scores) if r.get("phase2_ran")]
+    p2_no  = [bs for r, bs in zip(records, brier_scores) if not r.get("phase2_ran")]
+
+    # Calibration bins (10 bins, 0.0–1.0)
+    bins = {}
+    for r in records:
+        bin_key = round(r["prediction"] * 10) / 10
+        bins.setdefault(bin_key, []).append(r["resolution"])
+    calibration = {
+        str(k): {"predicted": k, "actual": sum(v) / len(v), "count": len(v)}
+        for k, v in sorted(bins.items())
+    }
+
+    # Auto-recommendations
+    recommendations = []
+    if avg_community_brier is not None:
+        if avg_brier > avg_community_brier * 1.1:
+            recommendations.append(
+                f"Bot Brier ({avg_brier:.4f}) > Community ({avg_community_brier:.4f}). "
+                f"Consider increasing COMMUNITY_WEIGHT_DEFAULT above {COMMUNITY_WEIGHT_DEFAULT}."
+            )
+        elif avg_brier < avg_community_brier * 0.95:
+            recommendations.append(
+                f"Bot outperforming community — current community weight may be too high."
+            )
+    if p2_yes and p2_no:
+        p2_yes_avg = sum(p2_yes) / len(p2_yes)
+        p2_no_avg  = sum(p2_no) / len(p2_no)
+        if p2_yes_avg > p2_no_avg * 1.1:
+            recommendations.append(
+                f"Phase 2 Brier ({p2_yes_avg:.4f}) worse than Phase 1-only ({p2_no_avg:.4f}). "
+                f"Consider raising DEBATE_SPREAD_THRESHOLD."
+            )
+
+    return {
+        "n_resolved": len(records),
+        "avg_brier": round(avg_brier, 4),
+        "brier_by_type": brier_by_type,
+        "avg_community_brier": round(avg_community_brier, 4) if avg_community_brier else None,
+        "phase2_brier": round(sum(p2_yes) / len(p2_yes), 4) if p2_yes else None,
+        "no_phase2_brier": round(sum(p2_no) / len(p2_no), 4) if p2_no else None,
+        "calibration_bins": calibration,
+        "recommendations": recommendations,
+    }
+
+
 ###############################################################################
 # ENSEMBLE MATH
 ###############################################################################
 
 def _parse_probability(text: str) -> Optional[float]:
-    """Extract trailing probability from model output. Tries 'Probability: ZZ%' first."""
+    """Extract trailing probability from model output."""
     for pattern in [
         r'[Rr]evised\s+[Pp]robability[:\s]+(\d+\.?\d*)\s*%',
         r'[Pp]robability[:\s]+(\d+\.?\d*)\s*%',
@@ -113,8 +240,24 @@ def _parse_probability(text: str) -> Optional[float]:
 
 def extremize_log_odds(probabilities: List[float], alpha: float = EXTREMIZATION_ALPHA) -> float:
     """
-    Calibeating-style log-odds extremization.
-    alpha > 1 pushes the ensemble away from 50% (corrects LLM hedging bias).
+    Calibeating-style log-odds extremization (Foster & Hart 2022).
+
+    The problem: LLMs hedge toward 50%. A model that "means" 80% often says 65%.
+    This is a calibration error (K in the Brier decomposition B = R + K).
+
+    The fix: Convert probabilities to log-odds space, average, multiply by alpha > 1,
+    convert back. This pushes the ensemble away from 50%, correcting K without
+    destroying R (the actual forecasting skill / sorting quality).
+
+    Example with alpha=1.2:
+      Models say [65%, 70%, 60%, 72%, 68%] → avg log-odds ≈ 0.77
+      Extremized: 0.77 * 1.2 = 0.92 → back to probability ≈ 71.5%
+      (Pushed from ~67% toward 72%)
+
+    Why it works: The Calibeating paper proves that any miscalibrated forecaster
+    can be "calibeaten" — their Brier score improved by at least their calibration
+    error — using a simple online procedure. Log-odds extremization approximates
+    this for the specific case of LLM hedging bias.
     """
     if not probabilities:
         return 0.5
@@ -129,14 +272,28 @@ def community_anchored_blend(
     model_pred: float,
     community_pred: Optional[float],
     community_weight: float = COMMUNITY_WEIGHT_DEFAULT,
+    apply_post_blend_extremization: bool = False,
 ) -> float:
-    """Blend ensemble prediction with Metaculus community. Weight is domain-adaptive."""
+    """
+    Blend ensemble prediction with Metaculus community.
+
+    v9 fix: optional post-blend re-extremization for econ questions.
+    Problem: COMMUNITY_WEIGHT_ECON=0.55 + alpha=1.2 means the blend partially
+    undoes the Calibeating correction (pulling back toward community/50%).
+    Solution: gentle re-extremization (alpha=1.1) after blending for econ only.
+    """
     if community_pred is None:
         return model_pred
     blended = (1 - community_weight) * model_pred + community_weight * community_pred
+
+    if apply_post_blend_extremization:
+        blended_clipped = max(0.02, min(0.98, blended))
+        lo = math.log(blended_clipped / (1 - blended_clipped))
+        blended = max(0.01, min(0.99, 1 / (1 + math.exp(-1.1 * lo))))
+
     logger.info(
         f"  Community blend: ensemble={model_pred:.3f}, community={community_pred:.3f} "
-        f"→ {blended:.3f} (community_weight={community_weight})"
+        f"→ {blended:.3f} (weight={community_weight}, post_extremize={apply_post_blend_extremization})"
     )
     return max(0.01, min(0.99, blended))
 
@@ -149,6 +306,7 @@ def _extract_community_float(question: MetaculusQuestion) -> Optional[float]:
     except Exception:
         pass
     return None
+
 
 ###############################################################################
 # DATA SOURCE HELPERS
@@ -165,13 +323,10 @@ def _safe_get(url: str, timeout: int = 12, params: dict = None) -> dict | list |
     return None
 
 
-# ── AskNews (replaces DuckDuckGo) ────────────────────────────────────────────
-
 async def fetch_asknews(query: str) -> str:
     """
-    Real-time, AI-summarized news via AskNews SDK.
-    Requires ASKNEWS_CLIENT_ID + ASKNEWS_CLIENT_SECRET (or ASKNEWS_API_KEY) in env.
-    Returns a prompt-ready news context string.
+    Primary news source. Requires ASKNEWS_CLIENT_ID + ASKNEWS_CLIENT_SECRET
+    (or ASKNEWS_API_KEY) in env. If missing, logs a WARNING — fix your env vars.
     """
     try:
         from asknews_sdk import AskNewsSDK
@@ -184,14 +339,13 @@ async def fetch_asknews(query: str) -> str:
         elif client_id and client_secret:
             ask = AskNewsSDK(client_id=client_id, client_secret=client_secret)
         else:
-            logger.warning("AskNews: no credentials found in environment.")
+            logger.warning("AskNews: no credentials in env. Set ASKNEWS_API_KEY or "
+                           "ASKNEWS_CLIENT_ID + ASKNEWS_CLIENT_SECRET.")
             return ""
 
         result = ask.news.search_news(
-            query=query[:200],
-            n_articles=10,
-            return_type="string",
-            strategy="latest news",
+            query=query[:200], n_articles=10,
+            return_type="string", strategy="latest news",
         )
         context = result.as_string if hasattr(result, "as_string") else str(result)
         return f"**AskNews (Real-time):**\n{context[:2000]}"
@@ -200,14 +354,7 @@ async def fetch_asknews(query: str) -> str:
         return ""
 
 
-# ── arXiv (academic papers, conditional on topic) ────────────────────────────
-
 def fetch_arxiv(query_text: str) -> str:
-    """
-    Search arXiv for relevant recent papers.
-    Activated only for AI / science / tech / health / climate questions.
-    Free, no API key required. Uses the official arxiv Python wrapper.
-    """
     arxiv_kws = [
         "ai", "artificial intelligence", "machine learning", "model", "algorithm",
         "study", "research", "trial", "paper", "published", "evidence",
@@ -221,31 +368,24 @@ def fetch_arxiv(query_text: str) -> str:
         import arxiv as arxiv_lib
         client = arxiv_lib.Client()
         search = arxiv_lib.Search(
-            query=query_text[:120],
-            max_results=5,
+            query=query_text[:120], max_results=5,
             sort_by=arxiv_lib.SortCriterion.SubmittedDate,
         )
         results = list(client.results(search))
         if not results:
             return ""
-        lines = []
-        for r in results:
-            abstract = (r.summary or "")[:200].replace("\n", " ")
-            lines.append(
-                f"  - ({r.published.year if r.published else '?'}) "
-                f"**{r.title}**: {abstract}..."
-            )
+        lines = [
+            f"  - ({r.published.year if r.published else '?'}) "
+            f"**{r.title}**: {(r.summary or '')[:200].replace(chr(10), ' ')}..."
+            for r in results
+        ]
         return "**Academic Preprints (arXiv):**\n" + "\n".join(lines)
     except Exception as e:
         logger.warning(f"arXiv fetch failed: {e}")
         return ""
 
+
 def fetch_semantic_scholar(query_text: str) -> str:
-    """
-    Search Semantic Scholar for relevant papers.
-    Activated only for science / health / technology / research questions.
-    Free API, no key required.
-    """
     academic_kws = [
         "study", "research", "trial", "paper", "published", "evidence",
         "science", "technology", "ai", "model", "disease", "drug", "vaccine",
@@ -257,29 +397,22 @@ def fetch_semantic_scholar(query_text: str) -> str:
         keywords = " ".join(query_text.split()[:8])
         data = _safe_get(
             "https://api.semanticscholar.org/graph/v1/paper/search",
-            params={
-                "query": keywords,
-                "limit": 5,
-                "fields": "title,year,abstract,citationCount",
-            },
+            params={"query": keywords, "limit": 5,
+                    "fields": "title,year,abstract,citationCount"},
             timeout=12,
         )
         if not data or not data.get("data"):
             return ""
-        lines = []
-        for paper in data["data"][:5]:
-            title    = paper.get("title", "No title")
-            year     = paper.get("year", "?")
-            citations= paper.get("citationCount", 0)
-            abstract = (paper.get("abstract") or "")[:200]
-            lines.append(f"  - ({year}, {citations} citations) **{title}**: {abstract}...")
+        lines = [
+            f"  - ({p.get('year','?')}, {p.get('citationCount',0)} cites) "
+            f"**{p.get('title','?')}**: {(p.get('abstract') or '')[:200]}..."
+            for p in data["data"][:5]
+        ]
         return "**Academic Literature (Semantic Scholar):**\n" + "\n".join(lines)
     except Exception as e:
         logger.warning(f"Semantic Scholar fetch failed: {e}")
         return ""
 
-
-# ── Remaining free data sources (unchanged from v4) ──────────────────────────
 
 def fetch_gdelt_articles(query_text: str, max_articles: int = 8) -> str:
     import requests
@@ -325,14 +458,14 @@ def fetch_polymarket_data(query_text: str) -> str:
             return ""
         lines = []
         for m in data[:5]:
-            title     = m.get("question", m.get("title", "Unknown"))
-            prices_raw= m.get("outcomePrices", "")
-            outcomes  = m.get("outcomes", "")
-            vol       = m.get("volume24hr", 0)
+            title      = m.get("question", m.get("title", "Unknown"))
+            prices_raw = m.get("outcomePrices", "")
+            outcomes   = m.get("outcomes", "")
+            vol        = m.get("volume24hr", 0)
             try:
                 prices   = json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
                 outcomes = json.loads(outcomes) if isinstance(outcomes, str) else outcomes
-                price_str= ", ".join(f"{o}: {float(p)*100:.0f}%" for o, p in zip(outcomes, prices))
+                price_str = ", ".join(f"{o}: {float(p)*100:.0f}%" for o, p in zip(outcomes, prices))
             except Exception:
                 price_str = str(prices_raw)
             lines.append(f"  - {title} → {price_str} (24h vol: ${float(vol):,.0f})")
@@ -498,6 +631,7 @@ def fetch_who_health_data(query_text: str) -> str:
         logger.warning(f"WHO GHO fetch failed: {e}")
         return ""
 
+
 def fetch_media_trend(query_text: str) -> str:
     import requests
     try:
@@ -559,13 +693,6 @@ def fetch_sec_filings(query_text: str) -> str:
 # MULTI-MODEL DEBATE ENGINE
 ###############################################################################
 
-# Phase 1 structured prompt (v8 — tighter and more directive than v7).
-# Key improvements:
-#   - Explicit instruction to anchor on base rate FIRST before adjusting
-#   - Word budget guidance to keep responses short (respects MAX_TOKENS_PHASE1)
-#   - Stronger community prior instruction: default to within 10pp unless you have
-#     specific named evidence, not just "I think"
-#   - Range-before-number retained (empirically validated, Lu 2025)
 _PHASE1_STRUCTURE = """
 
 ## Your Forecast (follow this structure exactly — keep each section to 2-4 sentences)
@@ -592,9 +719,6 @@ If you have no specific counter-evidence, default to within 10pp of the communit
 One line only: "Probability: ZZ%"
 """
 
-# Phase 2 prompt — only triggered when Phase 1 spread > DEBATE_SPREAD_THRESHOLD.
-# Structured to force genuine engagement with disagreement rather than averaging.
-# Based on Gorur 2025: argument-probability coherence improves accuracy.
 _PHASE2_DEBATE_STRUCTURE = """
 
 ## Debate Task (keep each section to 2-3 sentences)
@@ -626,11 +750,6 @@ async def _call_model(
     temperature: float = 0.3,
     max_tokens: int = MAX_TOKENS_PHASE1,
 ) -> str:
-    """
-    Call a single model via OpenRouter.
-    max_tokens cap is critical for o3: without it, reasoning chains can hit
-    6-8k output tokens at $8/M, turning a $0.05 call into $0.50+.
-    """
     try:
         llm = GeneralLlm(
             model=model_id,
@@ -649,29 +768,21 @@ async def run_debate_ensemble(
     question_text: str,
     base_prompt: str,
     question_context: str = "",
-) -> tuple[float, str]:
+) -> tuple[float, str, bool]:
     """
-    Conditional two-phase debate ensemble (v8).
+    Two-phase debate ensemble (v9).
 
-    Phase 1 — Always runs (5 parallel calls).
-        Each model produces: reference class → base rate → inside-view adjustment
-        → probability range → community check → final probability.
+    Phase 1: All 5 models independently produce a structured forecast from the
+    research brief → each outputs a probability.
 
-    Phase 2 — Conditional on Phase 1 spread.
-        Only triggered when max(Phase 1 probs) - min(Phase 1 probs) > DEBATE_SPREAD_THRESHOLD.
-        When spread is low (≤ threshold), models already agree → Phase 2 adds noise.
-        When spread is high (> threshold), genuine disagreement exists → debate resolves it.
+    Aggregation: Collect all 5 probabilities → Calibeating log-odds extremization
+    (alpha=1.2) to correct LLM hedging bias → single ensemble probability.
 
-        The threshold is informed by ensemble learning theory: diversity only improves
-        ensemble accuracy when component models are making independent errors.
-        Low spread = correlated errors = no debate value.
-        High spread = independent errors = debate can identify which model found
-        the signal the others missed.
+    Phase 2 (conditional): If Phase 1 spread > 15pp, genuine disagreement exists.
+    Each model sees all Phase 1 outputs and must diagnose the disagreement,
+    steel-man the outlier, and revise. Re-aggregate Phase 2 outputs.
 
-    Aggregation:
-        - If Phase 2 ran: extremize Phase 2 probs
-        - If Phase 2 skipped: extremize Phase 1 probs directly
-        Community blend applied separately in _run_forecast_on_binary.
+    Returns: (probability, reasoning_log, phase2_ran)
     """
     logger.info("=== DEBATE ENSEMBLE: Phase 1 — Independent structured forecasts ===")
 
@@ -696,12 +807,12 @@ async def run_debate_ensemble(
     valid_p1 = {n: p for n, p in phase1_probs.items() if p is not None}
     if not valid_p1:
         logger.error("All Phase 1 calls failed — returning 0.5")
-        return 0.5, "All Phase 1 model calls failed."
+        return 0.5, "All Phase 1 model calls failed.", False
 
     p1_vals   = list(valid_p1.values())
     p1_min    = min(p1_vals)
     p1_max    = max(p1_vals)
-    p1_spread = p1_max - p1_min   # kept as decimal for threshold comparison
+    p1_spread = p1_max - p1_min
 
     p1_summary = (
         f"Phase 1 range: {p1_min*100:.0f}% – {p1_max*100:.0f}%  "
@@ -720,7 +831,6 @@ async def run_debate_ensemble(
             f"(spread {p1_spread*100:.0f}pp > threshold {DEBATE_SPREAD_THRESHOLD*100:.0f}pp) ==="
         )
 
-        # Cap Phase 1 outputs fed into the debate context — controls Phase 2 input cost
         _P1_CONTEXT_CAP = 800
         debate_context = "\n\n".join(
             f"### {name} — Phase 1: {f'{p*100:.1f}%' if p else 'PARSE FAIL'}\n"
@@ -759,19 +869,17 @@ async def run_debate_ensemble(
                     final_probs.append(fallback)
                     logger.info(f"  Phase 2 – {name}: parse fail → P1 fallback {fallback*100:.1f}%")
 
-        # If Phase 2 entirely failed, fall back to Phase 1
         if not final_probs:
             logger.warning("Phase 2 produced no valid probs — falling back to Phase 1")
             final_probs = p1_vals
     else:
         logger.info(
             f"=== DEBATE ENSEMBLE: Phase 2 SKIPPED "
-            f"(spread {p1_spread*100:.0f}pp ≤ threshold {DEBATE_SPREAD_THRESHOLD*100:.0f}pp) — "
-            f"models agree, using Phase 1 directly ==="
+            f"(spread {p1_spread*100:.0f}pp ≤ threshold {DEBATE_SPREAD_THRESHOLD*100:.0f}pp) ==="
         )
         final_probs = p1_vals
 
-    # ── Aggregation ───────────────────────────────────────────────────────────
+    # ── Calibeating aggregation ───────────────────────────────────────────────
     final_prob = extremize_log_odds(final_probs, alpha=EXTREMIZATION_ALPHA)
     final_spread = (max(final_probs) - min(final_probs)) * 100 if len(final_probs) > 1 else 0
 
@@ -809,7 +917,59 @@ async def run_debate_ensemble(
         f"Log-odds extremization (α={EXTREMIZATION_ALPHA}): **{final_prob*100:.1f}%**\n"
     )
 
-    return final_prob, reasoning
+    return final_prob, reasoning, phase2_triggered
+
+
+###############################################################################
+# 3-MODEL ENSEMBLE FOR NUMERIC/DATE/MC (v9 — NEW)
+###############################################################################
+
+# Numeric/Date/MC now get a 3-model ensemble instead of single DeepSeek-R1.
+# Full 5-model debate is overkill (no binary probability to parse/debate),
+# but 3 diverse models + best-structured-response selection catches outlier
+# failures that sink single-model predictions.
+
+ENSEMBLE_NUMERIC_MODELS = {
+    "DeepSeek-R1":   "openrouter/deepseek/deepseek-r1",
+    "GPT-o3":        "openrouter/openai/o3",
+    "Claude-Sonnet": "openrouter/anthropic/claude-sonnet-4-6",
+}
+
+
+async def _run_numeric_ensemble(prompt: str) -> str:
+    """
+    Run 3 models on a numeric/date/MC prompt.
+    Pick the most structurally complete response (most parseable percentile lines).
+    Falls back gracefully if models fail.
+    """
+    tasks = {
+        name: _call_model(model_id, prompt, max_tokens=MAX_TOKENS_FORECAST)
+        for name, model_id in ENSEMBLE_NUMERIC_MODELS.items()
+    }
+    raw = await asyncio.gather(*tasks.values(), return_exceptions=True)
+    results = {
+        name: (r if isinstance(r, str) else "")
+        for name, r in zip(tasks.keys(), raw)
+    }
+
+    valid = {n: r for n, r in results.items() if r.strip()}
+    if not valid:
+        return ""
+    if len(valid) == 1:
+        return list(valid.values())[0]
+
+    def _count_percentile_lines(text: str) -> int:
+        return len(re.findall(r'[Pp]ercentile\s+\d+', text))
+
+    scored = [(name, text, _count_percentile_lines(text)) for name, text in valid.items()]
+    scored.sort(key=lambda x: x[2], reverse=True)
+    best_name, best_text, best_score = scored[0]
+    logger.info(
+        f"  Numeric ensemble: {len(valid)}/{len(ENSEMBLE_NUMERIC_MODELS)} responded. "
+        f"Selected {best_name} (structure score: {best_score})"
+    )
+    return best_text
+
 
 ###############################################################################
 # MAIN BOT CLASS
@@ -829,27 +989,27 @@ class DanDanDonkeyBot(ForecastBot):
             asknews_raw = await fetch_asknews(q_text)
             asknews_data = asknews_raw[:_SRC_CAP_ASKNEWS] if asknews_raw else ""
 
-            # Synchronous data sources — run in executor, each capped to avoid token bloat
+            # Synchronous data sources — run in executor, each capped
             loop = asyncio.get_event_loop()
             def _gather_sync():
                 raw = [
-                    fetch_metaculus_community(question),   # always — strong prior
-                    fetch_polymarket_data(q_text),         # prediction market prices
-                    fetch_gdelt_articles(q_text),          # recent headlines
-                    fetch_fred_data(q_text),               # econ time-series (conditional)
-                    fetch_world_bank_data(q_text),         # macro indicators (conditional)
-                    fetch_who_health_data(q_text),         # health stats (conditional)
-                    fetch_wikipedia_context(q_text),       # background
-                    fetch_media_trend(q_text),             # GDELT volume trend
-                    fetch_sec_filings(q_text),             # SEC filings (conditional)
-                    fetch_semantic_scholar(q_text),        # academic papers (conditional)
-                    fetch_arxiv(q_text),                   # preprints (conditional)
+                    fetch_metaculus_community(question),
+                    fetch_polymarket_data(q_text),
+                    fetch_gdelt_articles(q_text),
+                    fetch_fred_data(q_text),
+                    fetch_world_bank_data(q_text),
+                    fetch_who_health_data(q_text),
+                    fetch_wikipedia_context(q_text),
+                    fetch_media_trend(q_text),
+                    fetch_sec_filings(q_text),
+                    fetch_semantic_scholar(q_text),
+                    fetch_arxiv(q_text),
+                    fetch_reddit_context(q_text),
                 ]
                 return [s[:_SRC_CAP_DEFAULT] for s in raw if s]
 
             sync_sources = await loop.run_in_executor(None, _gather_sync)
 
-            # Cap total external_data to keep research prompt input tokens predictable
             raw_external = "\n\n".join([asknews_data] + sync_sources)
             external_data = (
                 raw_external[:_EXTERNAL_DATA_CAP] + "\n[...truncated for length]"
@@ -916,7 +1076,7 @@ class DanDanDonkeyBot(ForecastBot):
             logger.info(f"Research complete for {question.page_url}")
             return research
 
-    # ── Binary questions: full debate ensemble ────────────────────────────────
+    # ── Binary questions: full 5-model debate ensemble ────────────────────────
 
     async def _run_forecast_on_binary(
         self, question: BinaryQuestion, research: str
@@ -962,7 +1122,7 @@ class DanDanDonkeyBot(ForecastBot):
             Resolution: {question.resolution_criteria[:300]}
         """)
 
-        ensemble_prob, debate_reasoning = await run_debate_ensemble(
+        ensemble_prob, debate_reasoning, phase2_ran = await run_debate_ensemble(
             question_text=question.question_text,
             base_prompt=base_prompt,
             question_context=question_context,
@@ -970,20 +1130,37 @@ class DanDanDonkeyBot(ForecastBot):
 
         community_pred = _extract_community_float(question)
         community_weight = _get_community_weight(question.question_text)
-        final_prob = community_anchored_blend(ensemble_prob, community_pred, community_weight)
+        is_econ = community_weight > COMMUNITY_WEIGHT_DEFAULT
+
+        final_prob = community_anchored_blend(
+            ensemble_prob, community_pred, community_weight,
+            apply_post_blend_extremization=is_econ,
+        )
 
         full_reasoning = (
             debate_reasoning
             + f"\n\n### Community Blend\n"
             + f"Ensemble: {ensemble_prob*100:.1f}%  |  "
             + f"Community: {f'{community_pred*100:.1f}%' if community_pred else 'N/A'}  |  "
-            + f"Final (community_weight={community_weight}): **{final_prob*100:.1f}%**"
+            + f"Final (weight={community_weight}"
+            + f"{', post-extremized' if is_econ else ''}): **{final_prob*100:.1f}%**"
+        )
+
+        # Log to postmortem
+        _log_prediction(
+            question_url=getattr(question, "page_url", ""),
+            question_text=question.question_text,
+            prediction=final_prob,
+            community_pred=community_pred,
+            ensemble_pred=ensemble_prob,
+            phase2_ran=phase2_ran,
+            question_type="binary",
         )
 
         logger.info(f"Final prediction for {question.page_url}: {final_prob:.3f}")
         return ReasonedPrediction(prediction_value=final_prob, reasoning=full_reasoning)
 
-    # ── Multiple choice ───────────────────────────────────────────────────────
+    # ── Multiple choice: 3-model ensemble ─────────────────────────────────────
 
     async def _run_forecast_on_multiple_choice(
         self, question: MultipleChoiceQuestion, research: str
@@ -1018,7 +1195,9 @@ class DanDanDonkeyBot(ForecastBot):
             Remove any "Option" prefix not part of the actual option name.
             Include 0% options.
         """)
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await _run_numeric_ensemble(prompt)
+        if not reasoning:
+            reasoning = await self.get_llm("default", "llm").invoke(prompt)
         predicted_option_list: PredictedOptionList = await structure_output(
             text_to_structure=reasoning, output_type=PredictedOptionList,
             model=self.get_llm("parser", "llm"),
@@ -1027,7 +1206,7 @@ class DanDanDonkeyBot(ForecastBot):
         )
         return ReasonedPrediction(prediction_value=predicted_option_list, reasoning=reasoning)
 
-    # ── Numeric ───────────────────────────────────────────────────────────────
+    # ── Numeric: 3-model ensemble ─────────────────────────────────────────────
 
     async def _run_forecast_on_numeric(
         self, question: NumericQuestion, research: str
@@ -1062,7 +1241,9 @@ class DanDanDonkeyBot(ForecastBot):
         return await self._numeric_prompt_to_forecast(question, prompt)
 
     async def _numeric_prompt_to_forecast(self, question, prompt):
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await _run_numeric_ensemble(prompt)
+        if not reasoning:
+            reasoning = await self.get_llm("default", "llm").invoke(prompt)
         parsing_instructions = clean_indents(f"""
             Numeric forecast for: "{question.question_text}".
             Units: {question.unit_of_measure}. Range: {question.lower_bound} to {question.upper_bound}.
@@ -1077,7 +1258,7 @@ class DanDanDonkeyBot(ForecastBot):
         prediction = NumericDistribution.from_question(percentile_list, question)
         return ReasonedPrediction(prediction_value=prediction, reasoning=reasoning)
 
-    # ── Date ──────────────────────────────────────────────────────────────────
+    # ── Date: 3-model ensemble ────────────────────────────────────────────────
 
     async def _run_forecast_on_date(
         self, question: DateQuestion, research: str
@@ -1110,7 +1291,9 @@ class DanDanDonkeyBot(ForecastBot):
         return await self._date_prompt_to_forecast(question, prompt)
 
     async def _date_prompt_to_forecast(self, question, prompt):
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await _run_numeric_ensemble(prompt)
+        if not reasoning:
+            reasoning = await self.get_llm("default", "llm").invoke(prompt)
         parsing_instructions = clean_indents(f"""
             Date forecast for: "{question.question_text}".
             Range: {question.lower_bound} to {question.upper_bound}.
@@ -1244,7 +1427,7 @@ def save_summary_report(
                 delta_str = f"{delta:+.1f}pp"
 
             p1_probs, p2_probs = [], []
-            p2_ran = "Phase 2 — Skipped" not in reasoning  # True if debate was triggered
+            p2_ran = "Phase 2 — Skipped" not in reasoning
 
             for line in reasoning.split("\n"):
                 if "Phase 1" in line and "%" in line:
@@ -1252,7 +1435,6 @@ def save_summary_report(
                 if "Phase 2" in line and "%" in line and "Skipped" not in line:
                     p2_probs += [float(m) for m in _re.findall(r'(\d+\.?\d*)%', line)]
 
-            # Extract the Phase 1 spread from the reasoning log
             spread_match = _re.search(r'spread[:\s]+(\d+)pp', reasoning)
             spread_str = f"{spread_match.group(1)}pp" if spread_match else "N/A"
 
@@ -1274,7 +1456,7 @@ def save_summary_report(
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     md = [
-        "# DanDanDonkeyBot v8 — Forecast Summary",
+        "# DanDanDonkeyBot v9 — Forecast Summary",
         f"*Generated: {now} | Questions: {len(rows)}*",
         f"*Ensemble: {', '.join(ENSEMBLE_MODELS.keys())} | α={EXTREMIZATION_ALPHA}*",
         f"*Community weight: {COMMUNITY_WEIGHT_DEFAULT} (default) / {COMMUNITY_WEIGHT_ECON} (econ) | "
@@ -1304,6 +1486,22 @@ def save_summary_report(
     else:
         md.append("- None — all within 5pp of community.")
 
+    # Append postmortem stats if available
+    stats = compute_postmortem_stats()
+    if "error" not in stats:
+        md += [
+            "", "## Postmortem Stats (resolved questions)", "",
+            f"- Resolved: {stats['n_resolved']}",
+            f"- Bot Brier: {stats['avg_brier']:.4f}",
+            f"- Community Brier: {stats.get('avg_community_brier', 'N/A')}",
+            f"- Phase 2 Brier: {stats.get('phase2_brier', 'N/A')}",
+            f"- No-Phase-2 Brier: {stats.get('no_phase2_brier', 'N/A')}",
+        ]
+        if stats.get("recommendations"):
+            md += ["", "### Tuning Recommendations"]
+            for rec in stats["recommendations"]:
+                md.append(f"- {rec}")
+
     with open(output_path, "w") as f:
         f.write("\n".join(md))
     logger.info(f"Summary report saved to {output_path}")
@@ -1321,39 +1519,42 @@ if __name__ == "__main__":
     logging.getLogger("LiteLLM").setLevel(logging.WARNING)
     logging.getLogger("LiteLLM").propagate = False
 
-    parser = argparse.ArgumentParser(description="DanDanDonkeyBot v8")
+    parser = argparse.ArgumentParser(description="DanDanDonkeyBot v9")
     parser.add_argument(
         "--mode",
-        choices=["tournament", "metaculus_cup", "test_questions"],
+        choices=["tournament", "metaculus_cup", "test_questions", "postmortem"],
         default="tournament",
     )
     args = parser.parse_args()
+
+    # Postmortem mode: compute and print stats, no forecasting
+    if args.mode == "postmortem":
+        stats = compute_postmortem_stats()
+        print(json.dumps(stats, indent=2))
+        exit(0)
+
     run_mode: Literal["tournament", "metaculus_cup", "test_questions"] = args.mode
 
     danbot = DanDanDonkeyBot(
         research_reports_per_question=1,
-        predictions_per_research_report=1,
+        predictions_per_research_report=3,  # v9: restored from 1 for variance reduction
         use_research_summary_to_forecast=False,
-        publish_reports_to_metaculus=False,
+        publish_reports_to_metaculus=True,   # v9: enabled for competition
         folder_to_save_reports_to="reports",
         skip_previously_forecasted_questions=True,
         extra_metadata_in_explanation=True,
         llms={
-            # Researcher: DeepSeek-chat synthesises the brief — plenty capable for structured
-            # summarisation and much cheaper than Sonnet ($0.14/$0.28 vs $3/$15 per 1M tokens).
-            # Switch back to Claude Sonnet if research quality noticeably degrades.
             "researcher": GeneralLlm(
                 model="openrouter/deepseek/deepseek-chat",
                 temperature=0.2, timeout=120, allowed_tries=2,
                 max_tokens=MAX_TOKENS_RESEARCH,
             ),
-            # Default: used for numeric/date/MC questions (binary uses debate ensemble)
+            # Default: fallback for numeric/date/MC if 3-model ensemble fails
             "default": GeneralLlm(
                 model="openrouter/deepseek/deepseek-r1",
                 temperature=0.3, timeout=240, allowed_tries=2,
                 max_tokens=MAX_TOKENS_FORECAST,
             ),
-            # Lightweight models for parsing and summarisation
             "summarizer": "openrouter/deepseek/deepseek-chat",
             "parser":     "openrouter/deepseek/deepseek-chat",
         },
