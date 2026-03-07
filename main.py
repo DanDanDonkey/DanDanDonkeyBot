@@ -977,10 +977,11 @@ class DanDanDonkeyBot(ForecastBot):
             elif not researcher or researcher in ("None", "no_research"):
                 research = external_data
             else:
-                research = await self.get_llm("researcher", "llm").invoke(research_prompt)
-
-            logger.info(f"Research complete for {question.page_url}")
-            return research
+                research = await GeneralLlm(
+                    model=researcher,
+                    temperature=0.2, timeout=120, allowed_tries=2,
+                    max_tokens=MAX_TOKENS_RESEARCH,
+                ).invoke(research_prompt)
 
     async def _run_forecast_on_binary(
         self, question: BinaryQuestion, research: str
