@@ -1576,8 +1576,6 @@ if __name__ == "__main__":
 
     elif run_mode == "test_questions":
         EXAMPLE_QUESTIONS = [
-            "https://www.metaculus.com/questions/578/human-extinction-by-2100/",
-            "https://www.metaculus.com/questions/22427/number-of-new-leading-ai-labs/",
             "https://www.metaculus.com/questions/25523/nigel-farage-uk-pm-before-jan-1-2035/",
         ]
         danbot.skip_previously_forecasted_questions = False
