@@ -44,11 +44,11 @@ METACULUS_OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY")
 ###############################################################################
 
 ENSEMBLE_MODELS = {
-    "DeepSeek-R1":     "openrouter/deepseek/deepseek-r1:free",
-    "DeepSeek-V3":     "openrouter/deepseek/deepseek-chat:free",
-    "Qwen3-235B":      "openrouter/qwen/qwen3-235b-a22b:free",
-    "Llama4-Maverick": "openrouter/meta-llama/llama-4-maverick:free",
-    "Mistral-Small":   "openrouter/mistralai/mistral-small-3.1-24b-instruct:free",
+    "DeepSeek-R1":     "openrouter/deepseek/deepseek-r1",
+    "DeepSeek-V3":     "openrouter/deepseek/deepseek-chat-v3-0324",
+    "Qwen3-235B":      "openrouter/qwen/qwen3-235b-a22b",
+    "Llama4-Maverick": "openrouter/meta-llama/llama-4-maverick",
+    "Mistral-Small":   "openrouter/mistralai/mistral-small-3.1-24b-instruct",
 }
 
 EXTREMIZATION_ALPHA = 1.2
@@ -843,9 +843,9 @@ async def run_debate_ensemble(
 ###############################################################################
 
 ENSEMBLE_NUMERIC_MODELS = {
-    "DeepSeek-R1":     "openrouter/deepseek/deepseek-r1:free",
-    "Qwen3-235B":      "openrouter/qwen/qwen3-235b-a22b:free",
-    "Llama4-Maverick": "openrouter/meta-llama/llama-4-maverick:free",
+    "DeepSeek-R1":     "openrouter/deepseek/deepseek-r1",
+    "Qwen3-235B":      "openrouter/qwen/qwen3-235b-a22b",
+    "Llama4-Maverick": "openrouter/meta-llama/llama-4-maverick",
 }
 
 
@@ -1442,17 +1442,17 @@ if __name__ == "__main__":
         extra_metadata_in_explanation=True,
         llms={
             "researcher": GeneralLlm(
-                model="openrouter/deepseek/deepseek-chat:free",
+                model="openrouter/deepseek/deepseek-chat-v3-0324",
                 temperature=0.2, timeout=120, allowed_tries=2,
                 max_tokens=MAX_TOKENS_RESEARCH,
             ),
             "default": GeneralLlm(
-                model="openrouter/deepseek/deepseek-r1:free",
+                model="openrouter/deepseek/deepseek-r1",
                 temperature=0.3, timeout=240, allowed_tries=2,
                 max_tokens=MAX_TOKENS_FORECAST,
             ),
-            "summarizer": "openrouter/deepseek/deepseek-chat:free",
-            "parser":     "openrouter/deepseek/deepseek-chat:free",
+            "summarizer": "openrouter/deepseek/deepseek-chat-v3-0324",
+            "parser":     "openrouter/deepseek/deepseek-chat-v3-0324",
         },
     )
 
