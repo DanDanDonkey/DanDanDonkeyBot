@@ -983,6 +983,9 @@ class DanDanDonkeyBot(ForecastBot):
                     max_tokens=MAX_TOKENS_RESEARCH,
                 ).invoke(research_prompt)
 
+            logger.info(f"Research complete for {question.page_url}")
+            return research
+
     async def _run_forecast_on_binary(
         self, question: BinaryQuestion, research: str
     ) -> ReasonedPrediction[float]:
