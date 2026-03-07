@@ -44,11 +44,11 @@ METACULUS_OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY")
 ###############################################################################
 
 ENSEMBLE_MODELS = {
-    "DeepSeek-R1":     "openrouter/deepseek/deepseek-r1",
-    "DeepSeek-V3":     "openrouter/deepseek/deepseek-chat",
-    "Qwen3-235B":      "openrouter/qwen/qwen3-235b-a22b",
-    "Llama4-Maverick": "openrouter/meta-llama/llama-4-maverick",
-    "Mistral-Small":   "openrouter/mistralai/mistral-small-3.1-24b-instruct",
+    "DeepSeek-R1":     "openrouter/deepseek/deepseek-r1:free",
+    "DeepSeek-V3":     "openrouter/deepseek/deepseek-chat:free",
+    "Qwen3-235B":      "openrouter/qwen/qwen3-235b-a22b:free",
+    "Llama4-Maverick": "openrouter/meta-llama/llama-4-maverick:free",
+    "Mistral-Small":   "openrouter/mistralai/mistral-small-3.1-24b-instruct:free",
 }
 
 EXTREMIZATION_ALPHA = 1.2
@@ -843,9 +843,9 @@ async def run_debate_ensemble(
 ###############################################################################
 
 ENSEMBLE_NUMERIC_MODELS = {
-    "DeepSeek-R1":     "openrouter/deepseek/deepseek-r1",
-    "Qwen3-235B":      "openrouter/qwen/qwen3-235b-a22b",
-    "Llama4-Maverick": "openrouter/meta-llama/llama-4-maverick",
+    "DeepSeek-R1":     "openrouter/deepseek/deepseek-r1:free",
+    "Qwen3-235B":      "openrouter/qwen/qwen3-235b-a22b:free",
+    "Llama4-Maverick": "openrouter/meta-llama/llama-4-maverick:free",
 }
 
 
@@ -1102,14 +1102,10 @@ class DanDanDonkeyBot(ForecastBot):
         """)
         reasoning = await _run_numeric_ensemble(prompt)
         if not reasoning:
-            reasoning = await GeneralLlm(
-                model="openrouter/deepseek/deepseek-r1",
-                temperature=0.3, timeout=240, allowed_tries=2,
-                max_tokens=MAX_TOKENS_FORECAST,
-            ).invoke(prompt)
+            reasoning = await self.get_llm("default", "llm").invoke(prompt)
         predicted_option_list: PredictedOptionList = await structure_output(
             text_to_structure=reasoning, output_type=PredictedOptionList,
-           model=GeneralLlm(model="openrouter/deepseek/deepseek-chat", temperature=0.1, timeout=60, allowed_tries=2),
+            model=self.get_llm("parser", "llm"),
             num_validation_samples=self._structure_output_validation_samples,
             additional_instructions=parsing_instructions,
         )
@@ -1150,11 +1146,7 @@ class DanDanDonkeyBot(ForecastBot):
     async def _numeric_prompt_to_forecast(self, question, prompt):
         reasoning = await _run_numeric_ensemble(prompt)
         if not reasoning:
-            reasoning = await GeneralLlm(
-                model="openrouter/deepseek/deepseek-r1",
-                temperature=0.3, timeout=240, allowed_tries=2,
-                max_tokens=MAX_TOKENS_FORECAST,
-            ).invoke(prompt)
+            reasoning = await self.get_llm("default", "llm").invoke(prompt)
         parsing_instructions = clean_indents(f"""
             Numeric forecast for: "{question.question_text}".
             Units: {question.unit_of_measure}. Range: {question.lower_bound} to {question.upper_bound}.
@@ -1162,7 +1154,7 @@ class DanDanDonkeyBot(ForecastBot):
         """)
         percentile_list: list[Percentile] = await structure_output(
             reasoning, list[Percentile],
-            model=GeneralLlm(model="openrouter/deepseek/deepseek-chat", temperature=0.1, timeout=60, allowed_tries=2),
+            model=self.get_llm("parser", "llm"),
             additional_instructions=parsing_instructions,
             num_validation_samples=self._structure_output_validation_samples,
         )
@@ -1202,11 +1194,7 @@ class DanDanDonkeyBot(ForecastBot):
     async def _date_prompt_to_forecast(self, question, prompt):
         reasoning = await _run_numeric_ensemble(prompt)
         if not reasoning:
-            reasoning = await GeneralLlm(
-                model="openrouter/deepseek/deepseek-r1",
-                temperature=0.3, timeout=240, allowed_tries=2,
-                max_tokens=MAX_TOKENS_FORECAST,
-            ).invoke(prompt)
+            reasoning = await self.get_llm("default", "llm").invoke(prompt)
         parsing_instructions = clean_indents(f"""
             Date forecast for: "{question.question_text}".
             Range: {question.lower_bound} to {question.upper_bound}.
@@ -1214,7 +1202,7 @@ class DanDanDonkeyBot(ForecastBot):
         """)
         date_percentile_list: list[DatePercentile] = await structure_output(
             reasoning, list[DatePercentile],
-            model=GeneralLlm(model="openrouter/deepseek/deepseek-chat", temperature=0.1, timeout=60, allowed_tries=2),
+            model=self.get_llm("parser", "llm"),
             additional_instructions=parsing_instructions,
             num_validation_samples=self._structure_output_validation_samples,
         )
@@ -1454,17 +1442,17 @@ if __name__ == "__main__":
         extra_metadata_in_explanation=True,
         llms={
             "researcher": GeneralLlm(
-                model="openrouter/deepseek/deepseek-chat",
+                model="openrouter/deepseek/deepseek-chat:free",
                 temperature=0.2, timeout=120, allowed_tries=2,
                 max_tokens=MAX_TOKENS_RESEARCH,
             ),
             "default": GeneralLlm(
-                model="openrouter/deepseek/deepseek-r1",
+                model="openrouter/deepseek/deepseek-r1:free",
                 temperature=0.3, timeout=240, allowed_tries=2,
                 max_tokens=MAX_TOKENS_FORECAST,
             ),
-            "summarizer": "openrouter/deepseek/deepseek-chat",
-            "parser":     "openrouter/deepseek/deepseek-chat",
+            "summarizer": "openrouter/deepseek/deepseek-chat:free",
+            "parser":     "openrouter/deepseek/deepseek-chat:free",
         },
     )
 
