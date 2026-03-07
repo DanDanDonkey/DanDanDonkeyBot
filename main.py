@@ -46,11 +46,11 @@ METACULUS_OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY")
 # 5-model ensemble: diverse providers, diverse training paradigms
 # All routed via OpenRouter (Metaculus free credits)
 ENSEMBLE_MODELS = {
-    "DeepSeek-R1":   "openrouter/deepseek/deepseek-r1",
-    "GPT-o3":        "openrouter/openai/o3",
-    "Grok-4":        "openrouter/x-ai/grok-4",
-    "Claude-Sonnet": "openrouter/anthropic/claude-sonnet-4-6",
-    "Llama-405B":    "openrouter/meta-llama/llama-3.1-405b-instruct",
+    "DeepSeek-R1":     "openrouter/deepseek/deepseek-r1",
+    "DeepSeek-V3":     "openrouter/deepseek/deepseek-chat",
+    "Qwen3-235B":      "openrouter/qwen/qwen3-235b-a22b",
+    "Llama4-Maverick": "openrouter/meta-llama/llama-4-maverick",
+    "Mistral-Small":   "openrouter/mistralai/mistral-small-3.1-24b-instruct",
 }
 
 # Calibeating extremization (Foster & Hart 2022):
@@ -66,12 +66,6 @@ COMMUNITY_WEIGHT_ECON    = 0.55
 # v9: Lowered from 0.20 to 0.15 — at 0.20, correlated LLM outputs
 # rarely triggered Phase 2. 0.15 catches more genuine disagreements.
 DEBATE_SPREAD_THRESHOLD = 0.15
-
-# Token caps — prevents o3 reasoning chains from blowing up costs
-MAX_TOKENS_PHASE1    = 1200
-MAX_TOKENS_PHASE2    = 1000
-MAX_TOKENS_RESEARCH  = 1500
-MAX_TOKENS_FORECAST  = 1500
 
 # External data per-source character caps
 _SRC_CAP_ASKNEWS   = 2500
@@ -930,9 +924,9 @@ async def run_debate_ensemble(
 # failures that sink single-model predictions.
 
 ENSEMBLE_NUMERIC_MODELS = {
-    "DeepSeek-R1":   "openrouter/deepseek/deepseek-r1",
-    "GPT-o3":        "openrouter/openai/o3",
-    "Claude-Sonnet": "openrouter/anthropic/claude-sonnet-4-6",
+    "DeepSeek-R1":     "openrouter/deepseek/deepseek-r1",
+    "Qwen3-235B":      "openrouter/qwen/qwen3-235b-a22b",
+    "Llama4-Maverick": "openrouter/meta-llama/llama-4-maverick",
 }
 
 
