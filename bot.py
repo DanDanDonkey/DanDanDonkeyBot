@@ -814,8 +814,8 @@ if __name__ == "__main__":
         llms={
             "default": GeneralLlm(model="openrouter/anthropic/claude-sonnet-4.6", temperature=1.0, timeout=300, allowed_tries=2),
             "researcher": GeneralLlm(model="openrouter/anthropic/claude-sonnet-4.6", temperature=1.0, timeout=300, allowed_tries=2),
-            "summarizer": GeneralLlm(model="openrouter/anthropic/claude-sonnet-4.6", temperature=1.0, timeout=120, allowed_tries=2),
-            "parser": GeneralLlm(model="openrouter/anthropic/claude-sonnet-4.6", temperature=1.0, timeout=120, allowed_tries=2),
+            "summarizer": GeneralLlm(model="openrouter/meta-llama/llama-4-maverick", temperature=0.3, timeout=120, allowed_tries=2),
+            "parser": GeneralLlm(model="openrouter/meta-llama/llama-4-maverick", temperature=0.3, timeout=120, allowed_tries=2),
         },
     )
 
