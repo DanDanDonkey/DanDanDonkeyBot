@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import re
 from typing import Optional
 
 from forecasting_tools import GeneralLlm
@@ -11,12 +12,29 @@ METACULUS_TOKEN = os.environ.get("METACULUS_TOKEN", "")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 
 ###############################################################################
+# CONSTANTS
+###############################################################################
+
+EXTREMIZATION_ALPHA      = 1.2
+COMMUNITY_WEIGHT_DEFAULT = 0.40
+COMMUNITY_WEIGHT_ECON    = 0.55
+DEBATE_SPREAD_THRESHOLD  = 0.15
+
+MAX_TOKENS_PHASE1    = 2000
+MAX_TOKENS_PHASE2    = 1500
+MAX_TOKENS_RESEARCH  = 1500
+MAX_TOKENS_FORECAST  = 1500
+
+_SRC_CAP_ASKNEWS   = 2500
+_SRC_CAP_DEFAULT   = 600
+_EXTERNAL_DATA_CAP = 6000
+
+###############################################################################
 # ENSEMBLE MODEL REGISTRY
 ###############################################################################
 
 ENSEMBLE_MODELS = {
     "DeepSeek-R1":     "openrouter/deepseek/deepseek-r1",
-    "DeepSeek-V3":     "openrouter/meta-llama/llama-3.3-70b-instruct",
     "Qwen3-235B":      "openrouter/qwen/qwen3-235b-a22b",
     "Llama4-Maverick": "openrouter/meta-llama/llama-4-maverick",
     "Mistral-Small":   "openrouter/mistralai/mistral-small-3.1-24b-instruct",
@@ -27,10 +45,6 @@ ENSEMBLE_NUMERIC_MODELS = {
     "Qwen3-235B":      "openrouter/qwen/qwen3-235b-a22b",
     "Llama4-Maverick": "openrouter/meta-llama/llama-4-maverick",
 }
-
-MAX_TOKENS_RESEARCH = 1500
-MAX_TOKENS_FORECAST = 1500
-
 
 ###############################################################################
 # SINGLE MODEL CALL
@@ -55,13 +69,11 @@ async def call_model(
         logger.warning(f"Model {model_id} failed: {e}")
         return ""
 
-
 ###############################################################################
 # NUMERIC ENSEMBLE (best-of-3 by structure score)
 ###############################################################################
 
 async def run_numeric_ensemble(prompt: str) -> str:
-    import re
     tasks = {
         name: call_model(model_id, prompt)
         for name, model_id in ENSEMBLE_NUMERIC_MODELS.items()
@@ -85,32 +97,6 @@ async def run_numeric_ensemble(prompt: str) -> str:
         [(name, text, _count_percentile_lines(text)) for name, text in valid.items()],
         key=lambda x: x[2], reverse=True,
     )
-    best_name, best_text, best_score = scored[0]
-    logger.info(
-        f"  Numeric ensemble: {len(valid)}/{len(ENSEMBLE_NUMERIC_MODELS)} responded. "
-        f"Selected {best_name} (structure score: {best_score})"
-    )
+    best_name, best_text, _ = scored[0]
+    logger.info(f"Numeric ensemble: {len(valid)}/{len(ENSEMBLE_NUMERIC_MODELS)} responded. Best: {best_name}")
     return best_text
-
-
-###############################################################################
-# PARSER / SUMMARIZER LLM (lightweight, used by structure_output)
-###############################################################################
-
-def get_parser_llm() -> GeneralLlm:
-    return GeneralLlm(
-        model="openrouter/deepseek/deepseek-r1",
-        temperature=0.1,
-        timeout=120,
-        allowed_tries=2,
-    )
-
-
-def get_researcher_llm() -> GeneralLlm:
-    return GeneralLlm(
-        model="openrouter/deepseek/deepseek-r1",
-        temperature=0.2,
-        timeout=120,
-        allowed_tries=2,
-        max_tokens=MAX_TOKENS_RESEARCH,
-    )
