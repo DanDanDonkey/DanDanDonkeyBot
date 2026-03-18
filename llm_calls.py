@@ -34,15 +34,16 @@ _EXTERNAL_DATA_CAP = 6000
 ###############################################################################
 
 ENSEMBLE_MODELS = {
-    "DeepSeek-R1":     "openrouter/deepseek/deepseek-r1",
-    "Qwen3-235B":      "openrouter/qwen/qwen3-235b-a22b",
+    "Claude-Sonnet":   "openrouter/anthropic/claude-sonnet-4.6",
+    "GPT-4o":          "openrouter/openai/gpt-4o",
     "Llama4-Maverick": "openrouter/meta-llama/llama-4-maverick",
-    "Mistral-Small":   "openrouter/mistralai/mistral-small-3.1-24b-instruct",
+    "DeepSeek-R1":     "openrouter/deepseek/deepseek-r1",
+    "Grok-4-Fast":     "openrouter/x-ai/grok-4-fast",
 }
 
 ENSEMBLE_NUMERIC_MODELS = {
+    "Claude-Sonnet":   "openrouter/anthropic/claude-sonnet-4.6",
     "DeepSeek-R1":     "openrouter/deepseek/deepseek-r1",
-    "Qwen3-235B":      "openrouter/qwen/qwen3-235b-a22b",
     "Llama4-Maverick": "openrouter/meta-llama/llama-4-maverick",
 }
 
