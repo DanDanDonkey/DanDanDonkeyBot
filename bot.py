@@ -812,10 +812,10 @@ if __name__ == "__main__":
         skip_previously_forecasted_questions=True,
         extra_metadata_in_explanation=True,
         llms={
-            "default": GeneralLlm(model="openrouter/deepseek/deepseek-r1", temperature=0.3, timeout=300, allowed_tries=2),
-            "summarizer": "openrouter/deepseek/deepseek-chat",
-            "researcher": GeneralLlm(model="openrouter/deepseek/deepseek-r1", temperature=0.3, timeout=300, allowed_tries=2),
-            "parser": "openrouter/deepseek/deepseek-chat",
+            "default": GeneralLlm(model="openrouter/anthropic/claude-sonnet-4.6", temperature=1.0, timeout=300, allowed_tries=2),
+            "researcher": GeneralLlm(model="openrouter/anthropic/claude-sonnet-4.6", temperature=1.0, timeout=300, allowed_tries=2),
+            "summarizer": GeneralLlm(model="openrouter/anthropic/claude-sonnet-4.6", temperature=1.0, timeout=120, allowed_tries=2),
+            "parser": GeneralLlm(model="openrouter/anthropic/claude-sonnet-4.6", temperature=1.0, timeout=120, allowed_tries=2),
         },
     )
 
