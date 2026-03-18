@@ -27,7 +27,6 @@ from forecasting_tools import (
     BinaryPrediction,
     PredictedOptionList,
     ReasonedPrediction,
-    SmartSearcher,
     clean_indents,
     structure_output,
 )
@@ -453,14 +452,6 @@ class DanDanDonkeyBot(ForecastBot):
                 research = await AskNewsSearcher().call_preconfigured_version(
                     researcher, research_prompt
                 )
-            elif isinstance(researcher, str) and researcher.startswith("smart-searcher"):
-                model_name = researcher.removeprefix("smart-searcher/")
-                searcher = SmartSearcher(
-                    model=model_name, temperature=0,
-                    num_searches_to_run=2, num_sites_per_search=10,
-                    use_advanced_filters=False,
-                )
-                research = await searcher.invoke(research_prompt)
             elif not researcher or researcher == "None" or researcher == "no_research":
                 research = external_data
             else:
@@ -813,7 +804,7 @@ if __name__ == "__main__":
         extra_metadata_in_explanation=True,
         llms={
             "default": GeneralLlm(model="openrouter/anthropic/claude-sonnet-4.6", temperature=1.0, timeout=300, allowed_tries=2),
-            "researcher": GeneralLlm(model="openrouter/anthropic/claude-sonnet-4.6", temperature=1.0, timeout=300, allowed_tries=2),
+            "researcher": "asknews/asknews-searcher",
             "summarizer": GeneralLlm(model="openrouter/meta-llama/llama-4-maverick", temperature=0.3, timeout=120, allowed_tries=2),
             "parser": GeneralLlm(model="openrouter/meta-llama/llama-4-maverick", temperature=0.3, timeout=120, allowed_tries=2),
         },
